@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import UploadFile, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.workers.tasks import process_document
+from app.workers.tasks import process_document_task
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
 ALLOWED_MIME_TYPES = {
@@ -39,7 +39,7 @@ class DocumentService:
         document_id = uuid.uuid4()
 
         # Enqueue background Celery task
-        task = process_document.delay(document_id=str(document_id), file_path=filename)
+        task = process_document_task.delay(document_id=str(document_id), file_path=filename)
 
         return {
             "task_id": task.id,

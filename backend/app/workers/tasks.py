@@ -1,3 +1,4 @@
+import logging
 from app.workers.celery_app import celery_app
 from app.services.file_processor import FileProcessor
 

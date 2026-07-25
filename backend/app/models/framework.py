@@ -1,11 +1,15 @@
+from __future__ import annotations
 import uuid
 from datetime import datetime, date
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
 
 from sqlalchemy import String, Text, DateTime, Date, Boolean, ForeignKey, UniqueConstraint, func, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+if TYPE_CHECKING:
+    from app.models.compliance_mapping import ComplianceMapping
 
 class RegulatoryFramework(Base):
     __tablename__ = "regulatory_frameworks"

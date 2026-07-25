@@ -1,11 +1,16 @@
+from __future__ import annotations
 import uuid
 from datetime import datetime
-from typing import List
+from typing import List, TYPE_CHECKING
 
 from sqlalchemy import String, DateTime, func, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+if TYPE_CHECKING:
+    from app.models.evidence import EvidenceArtifact
+    from app.models.compliance_mapping import ComplianceMapping
 
 class Organization(Base):
     __tablename__ = "organizations"

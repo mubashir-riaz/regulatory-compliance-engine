@@ -1,11 +1,16 @@
+from __future__ import annotations
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
 
 from sqlalchemy import String, Text, Integer, DateTime, ForeignKey, func, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+if TYPE_CHECKING:
+    from app.models.organization import Organization
+    from app.models.compliance_mapping import ComplianceMapping
 
 class EvidenceArtifact(Base):
     __tablename__ = "evidence_artifacts"

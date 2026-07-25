@@ -15,6 +15,9 @@ class DocumentResponse(BaseModel):
     file_path: str
     file_size: Optional[int] = None
     mime_type: Optional[str] = None
+    extracted_text: Optional[str] = None
+    page_count: Optional[int] = None
+    word_count: Optional[int] = None
     status: str
     created_at: datetime
     updated_at: datetime

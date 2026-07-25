@@ -19,7 +19,9 @@ class EvidenceArtifact(Base):
     file_size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     mime_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     extracted_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # parsed content
-    status: Mapped[str] = mapped_column(String(50), server_default="pending", nullable=False)  # pending, processing, completed, failed
+    page_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    word_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(50), server_default="PENDING", nullable=False)  # PENDING, PROCESSING, COMPLETED, FAILED
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.services.document_service import DocumentService
+from app.schemas.document import DocumentStatusResponse
 
 router = APIRouter()
 
@@ -27,7 +28,7 @@ async def upload_document(
         title=title
     )
 
-@router.get("/{document_id}/status")
+@router.get("/{document_id}/status", response_model=DocumentStatusResponse)
 async def get_document_status(
     document_id: UUID,
     db: AsyncSession = Depends(get_db)

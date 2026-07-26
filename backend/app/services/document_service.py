@@ -49,7 +49,7 @@ class DocumentService:
 
     async def get_document_status(self, document_id: UUID):
         """
-        Retrieve EvidenceArtifact from database and return processing status and extracted text.
+        Retrieve EvidenceArtifact from database and return processing status and text preview.
         Raises 404 HTTP exception if document does not exist.
         """
         repo = EvidenceArtifactRepository(self.db)
@@ -61,10 +61,17 @@ class DocumentService:
                 detail=f"Document with ID '{document_id}' not found."
             )
 
+        current_status = artifact.status.upper() if artifact.status else "PENDING"
+        text_preview = None
+
+        # Return text_preview (first 300 chars) only if processing is completed
+        if current_status == "COMPLETED" and artifact.extracted_text:
+            text_preview = artifact.extracted_text[:300]
+
         return {
             "document_id": str(artifact.id),
-            "status": artifact.status,
-            "extracted_text": artifact.extracted_text,
+            "status": current_status,
+            "text_preview": text_preview,
             "page_count": artifact.page_count,
             "word_count": artifact.word_count,
         }

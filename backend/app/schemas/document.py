@@ -23,3 +23,12 @@ class DocumentResponse(BaseModel):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+class DocumentStatusResponse(BaseModel):
+    document_id: UUID
+    status: str
+    text_preview: Optional[str] = None
+    page_count: Optional[int] = None
+    word_count: Optional[int] = None
+
+    model_config = ConfigDict(from_attributes=True)

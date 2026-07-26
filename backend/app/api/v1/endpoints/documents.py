@@ -26,3 +26,14 @@ async def upload_document(
         version_id=version_id,
         title=title
     )
+
+@router.get("/{document_id}/status")
+async def get_document_status(document_id: UUID):
+    """
+    Get document processing status (placeholder).
+    """
+    return {
+        "document_id": str(document_id),
+        "status": "PENDING",
+        "message": "Status endpoint placeholder"
+    }

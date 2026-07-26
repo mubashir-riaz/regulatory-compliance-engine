@@ -28,12 +28,12 @@ async def upload_document(
     )
 
 @router.get("/{document_id}/status")
-async def get_document_status(document_id: UUID):
+async def get_document_status(
+    document_id: UUID,
+    db: AsyncSession = Depends(get_db)
+):
     """
-    Get document processing status (placeholder).
+    Get document processing status and extracted content.
     """
-    return {
-        "document_id": str(document_id),
-        "status": "PENDING",
-        "message": "Status endpoint placeholder"
-    }
+    document_service = DocumentService(db)
+    return await document_service.get_document_status(document_id)

@@ -6,6 +6,7 @@ from fastapi import UploadFile, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.workers.tasks import process_document_task
+from app.repositories.evidence_repo import EvidenceArtifactRepository
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
 ALLOWED_MIME_TYPES = {
@@ -44,4 +45,26 @@ class DocumentService:
         return {
             "task_id": task.id,
             "status": "queued"
+        }
+
+    async def get_document_status(self, document_id: UUID):
+        """
+        Retrieve EvidenceArtifact from database and return processing status and extracted text.
+        Raises 404 HTTP exception if document does not exist.
+        """
+        repo = EvidenceArtifactRepository(self.db)
+        artifact = await repo.get_by_id(document_id)
+
+        if not artifact:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document with ID '{document_id}' not found."
+            )
+
+        return {
+            "document_id": str(artifact.id),
+            "status": artifact.status,
+            "extracted_text": artifact.extracted_text,
+            "page_count": artifact.page_count,
+            "word_count": artifact.word_count,
         }

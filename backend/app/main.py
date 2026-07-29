@@ -4,11 +4,15 @@ from app.core.config import settings
 from app.core.database import engine
 from app.db.base import Base
 
+from app.middleware.tenant import TenantMiddleware
+
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version="1.0.0",
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
 )
+
+app.add_middleware(TenantMiddleware)
 
 # Include API router
 app.include_router(api_router, prefix=settings.API_V1_STR)

@@ -5,7 +5,7 @@ from app.middleware.tenant import TenantMiddleware
 
 
 @pytest.mark.asyncio
-async def test_tenant_middleware_with_header():
+async def test_tenant_middleware_with_header(caplog):
     test_app = FastAPI()
     test_app.add_middleware(TenantMiddleware)
 
@@ -14,14 +14,16 @@ async def test_tenant_middleware_with_header():
         return {"tenant_id": getattr(request.state, "tenant_id", None)}
 
     transport = ASGITransport(app=test_app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/test-tenant", headers={"X-Tenant-ID": "tenant-abc-123"})
-        assert response.status_code == 200
-        assert response.json() == {"tenant_id": "tenant-abc-123"}
+    with caplog.at_level("INFO"):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/test-tenant", headers={"X-Tenant-ID": "tenant-abc-123"})
+            assert response.status_code == 200
+            assert response.json() == {"tenant_id": "tenant-abc-123"}
+            assert "Captured tenant ID: tenant-abc-123" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_tenant_middleware_without_header():
+async def test_tenant_middleware_without_header(caplog):
     test_app = FastAPI()
     test_app.add_middleware(TenantMiddleware)
 
@@ -30,7 +32,9 @@ async def test_tenant_middleware_without_header():
         return {"tenant_id": getattr(request.state, "tenant_id", None)}
 
     transport = ASGITransport(app=test_app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/test-tenant")
-        assert response.status_code == 200
-        assert response.json() == {"tenant_id": None}
+    with caplog.at_level("INFO"):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/test-tenant")
+            assert response.status_code == 200
+            assert response.json() == {"tenant_id": None}
+            assert "No tenant ID was provided" in caplog.text

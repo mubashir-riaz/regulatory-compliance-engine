@@ -52,26 +52,14 @@ async def _update_evidence_artifact(
         logger.error(f"Failed to update EvidenceArtifact in database for document_id={document_id}: {db_exc}", exc_info=True)
         return False
 
-def _run_async(coro):
+async def _process_document_pipeline(document_id: str, file_path: str) -> Dict[str, Any]:
     """
-    Run an async coroutine synchronously.
-    """
-    try:
-        return asyncio.run(coro)
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(coro)
-
-@celery_app.task(name="app.workers.tasks.process_document_task")
-def process_document_task(document_id: str, file_path: str):
-    """
-    Background Celery task to download an uploaded file, extract text and page/word counts,
-    save results to EvidenceArtifact, and manage task status (PROCESSING -> COMPLETED / FAILED).
+    Async implementation of the document processing pipeline.
     """
     logger.info(f"Starting background processing pipeline for document_id={document_id}, file_path={file_path}")
     
     # 1. Update processing status to PROCESSING
-    _run_async(_update_evidence_artifact(document_id=document_id, status=STATUS_PROCESSING))
+    await _update_evidence_artifact(document_id=document_id, status=STATUS_PROCESSING)
     
     try:
         processor = FileProcessor()
@@ -82,14 +70,12 @@ def process_document_task(document_id: str, file_path: str):
         word_count = result.get("word_count", 0)
         
         # 2. Save extracted text, page count, word count, and set status to COMPLETED
-        _run_async(
-            _update_evidence_artifact(
-                document_id=document_id,
-                status=STATUS_COMPLETED,
-                extracted_text=extracted_text,
-                page_count=page_count,
-                word_count=word_count,
-            )
+        await _update_evidence_artifact(
+            document_id=document_id,
+            status=STATUS_COMPLETED,
+            extracted_text=extracted_text,
+            page_count=page_count,
+            word_count=word_count,
         )
         
         logger.info(
@@ -109,10 +95,19 @@ def process_document_task(document_id: str, file_path: str):
         logger.error(f"Error during document processing pipeline for document_id={document_id}: {e}", exc_info=True)
         
         # 3. Update processing status to FAILED on errors
-        _run_async(_update_evidence_artifact(document_id=document_id, status=STATUS_FAILED))
+        await _update_evidence_artifact(document_id=document_id, status=STATUS_FAILED)
         
         return {
             "document_id": document_id,
             "status": STATUS_FAILED,
             "error": str(e),
         }
+
+@celery_app.task(name="app.workers.tasks.process_document_task")
+def process_document_task(document_id: str, file_path: str):
+    """
+    Background Celery task to download an uploaded file, extract text and page/word counts,
+    save results to EvidenceArtifact, and manage task status (PROCESSING -> COMPLETED / FAILED).
+    """
+    return asyncio.run(_process_document_pipeline(document_id=document_id, file_path=file_path))
+

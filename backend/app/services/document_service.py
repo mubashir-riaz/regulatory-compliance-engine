@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.workers.tasks import process_document_task
 from app.repositories.evidence_repo import EvidenceArtifactRepository
+from app.models.evidence import EvidenceArtifact
+from app.services.file_processor import FileProcessor
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
 ALLOWED_MIME_TYPES = {
@@ -36,15 +38,33 @@ class DocumentService:
                 detail=f"Invalid file type. Allowed types are: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
             )
 
-        # Generate a temporary document ID for tracking before database integration
+        # 1. Generate document ID
         document_id = uuid.uuid4()
+        
+        # 2. Create database record
+        repo = EvidenceArtifactRepository(self.db)
+        new_artifact = EvidenceArtifact(
+            id=document_id,
+            organization_id=UUID("11111111-1111-1111-1111-111111111111"),
+            name=title or filename,
+            file_path=filename,
+            status="PENDING"
+        )
+        await repo.create(new_artifact)
+        await self.db.commit()
 
-        # Enqueue background Celery task
+        # 3. Upload file to MinIO
+        processor = FileProcessor()
+        content = await file.read()
+        processor.upload_file(filename, content)
+
+        # 4. Enqueue background Celery task
         task = process_document_task.delay(document_id=str(document_id), file_path=filename)
 
         return {
             "task_id": task.id,
-            "status": "queued"
+            "status": "queued",
+            "document_id": str(document_id)
         }
 
     async def get_document_status(self, document_id: UUID):

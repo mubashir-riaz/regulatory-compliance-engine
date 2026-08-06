@@ -95,3 +95,9 @@ class FileProcessor:
     def _extract_txt(self, file_bytes: bytes) -> tuple[str, int]:
         text = file_bytes.decode("utf-8", errors="ignore")
         return text, 1
+    def upload_file(self, file_path: str, content: bytes) -> bool:
+        try:
+            self.s3_client.put_object(Bucket=self.bucket_name, Key=file_path, Body=content)
+            return True
+        except Exception as e:
+            raise

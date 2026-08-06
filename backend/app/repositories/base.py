@@ -28,7 +28,8 @@ class BaseRepository(Generic[ModelType]):
         if isinstance(obj_in, dict):
             create_data = obj_in
         else:
-            create_data = obj_in.model_dump(exclude_unset=True) if hasattr(obj_in, "model_dump") else obj_in.dict(exclude_unset=True)
+            # Use __dict__ for SQLAlchemy models
+            create_data = {c.key: getattr(obj_in, c.key) for c in obj_in.__table__.columns}
         
         db_obj = self.model(**create_data)
         self.session.add(db_obj)
@@ -40,7 +41,8 @@ class BaseRepository(Generic[ModelType]):
         if isinstance(obj_in, dict):
             update_data = obj_in
         else:
-            update_data = obj_in.model_dump(exclude_unset=True) if hasattr(obj_in, "model_dump") else obj_in.dict(exclude_unset=True)
+            # Use __dict__ for SQLAlchemy models
+            update_data = {c.key: getattr(obj_in, c.key) for c in obj_in.__table__.columns}
             
         for field, value in update_data.items():
             if hasattr(db_obj, field):

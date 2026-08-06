@@ -12,6 +12,7 @@ router = APIRouter()
 @router.post("/upload")
 async def upload_document(
     file: UploadFile = File(...),
+    organization_id: UUID = Form(...),
     framework_id: UUID = Form(...),
     version_id: UUID = Form(...),
     title: Optional[str] = Form(None),
@@ -23,6 +24,7 @@ async def upload_document(
     document_service = DocumentService(db)
     return await document_service.upload_document(
         file=file,
+        organization_id=organization_id,
         framework_id=framework_id,
         version_id=version_id,
         title=title

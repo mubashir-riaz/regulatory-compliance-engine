@@ -24,6 +24,7 @@ class DocumentService:
     async def upload_document(
         self,
         file: UploadFile,
+        organization_id: UUID,
         framework_id: UUID,
         version_id: UUID,
         title: Optional[str] = None
@@ -31,21 +32,18 @@ class DocumentService:
         filename = file.filename or ""
         ext = os.path.splitext(filename.lower())[1]
 
-        # Validate file type using extension or MIME type
         if ext not in ALLOWED_EXTENSIONS and file.content_type not in ALLOWED_MIME_TYPES:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid file type. Allowed types are: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
             )
 
-        # 1. Generate document ID
         document_id = uuid.uuid4()
         
-        # 2. Create database record
         repo = EvidenceArtifactRepository(self.db)
         new_artifact = EvidenceArtifact(
             id=document_id,
-            organization_id=UUID("11111111-1111-1111-1111-111111111111"),
+            organization_id=organization_id,
             name=title or filename,
             file_path=filename,
             status="PENDING"
@@ -53,12 +51,10 @@ class DocumentService:
         await repo.create(new_artifact)
         await self.db.commit()
 
-        # 3. Upload file to MinIO
         processor = FileProcessor()
         content = await file.read()
         processor.upload_file(filename, content)
 
-        # 4. Enqueue background Celery task
         task = process_document_task.delay(document_id=str(document_id), file_path=filename)
 
         return {

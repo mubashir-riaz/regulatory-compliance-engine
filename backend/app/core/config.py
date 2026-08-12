@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     
     # Redis / Celery
     REDIS_URL: str = "redis://redis:6379/0"
+
+    NEO4J_URL: str = "bolt://localhost:7687"
+    NEO4J_AUTH: str = "neo4j/password"
     
     # Qdrant
     QDRANT_URL: str = "http://qdrant:6333"

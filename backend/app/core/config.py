@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     QDRANT_URL: str = "http://qdrant:6333"
     QDRANT_API_KEY: Optional[str] = None
     
+    # Neo4j
+    NEO4J_URI: str = "bolt://neo4j:7687"
+    NEO4J_USER: str = "neo4j"
+    NEO4J_PASSWORD: str = "password"
+    
     # LLM (free providers)
     LLM_PROVIDER: str = "groq"   # or "gemini"
     GROQ_API_KEY: Optional[str] = None

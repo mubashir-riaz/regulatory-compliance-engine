@@ -111,6 +111,15 @@ class BaseGraphRelationship(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+    def to_cypher_properties(self) -> Dict[str, Any]:
+        """Convert relationship properties to a JSON-serializable dictionary."""
+        data = self.model_dump(mode="json", exclude={"source_id", "target_id", "rel_type"})
+        props = data.pop("properties", None) or {}
+        for k, v in data.items():
+            if v is not None:
+                props[k] = v
+        return props
+
 
 class HasVersionRelationship(BaseGraphRelationship):
     """(RegulatoryFramework)-[:HAS_VERSION]->(RegulatoryVersion)"""

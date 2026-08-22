@@ -8,7 +8,7 @@ models representing connections in the Neo4j graph database.
 from enum import Enum
 from datetime import datetime, date
 from uuid import UUID, uuid4
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field, ConfigDict
 
 
@@ -76,6 +76,11 @@ class RegulatoryObligation(BaseGraphNode):
     code: str
     title: str
     description: Optional[str] = None
+    clause: Optional[str] = None
+    category: Optional[str] = None
+    mandatory: Optional[bool] = None
+    keywords: Optional[List[str]] = None
+    source_text: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

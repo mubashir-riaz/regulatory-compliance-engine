@@ -688,3 +688,7 @@ class GraphService:
         if results:
             return results[0]
         return None
+
+
+# Global singleton instance for application usage
+graph_service = GraphService()

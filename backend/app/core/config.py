@@ -10,10 +10,18 @@ class Settings(BaseSettings):
     
     # Redis / Celery
     REDIS_URL: str = "redis://redis:6379/0"
+
+    NEO4J_URL: str = "bolt://localhost:7687"
+    NEO4J_AUTH: str = "neo4j/password"
     
     # Qdrant
     QDRANT_URL: str = "http://qdrant:6333"
     QDRANT_API_KEY: Optional[str] = None
+    
+    # Neo4j
+    NEO4J_URI: str = "bolt://neo4j:7687"
+    NEO4J_USER: str = "neo4j"
+    NEO4J_PASSWORD: str = "password"
     
     # LLM (free providers)
     LLM_PROVIDER: str = "groq"   # or "gemini"

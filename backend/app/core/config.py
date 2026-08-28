@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     # Qdrant
     QDRANT_URL: str = "http://qdrant:6333"
     QDRANT_API_KEY: Optional[str] = None
+    QDRANT_COLLECTION: str = "regulatory_obligations"
+    EMBEDDING_MODEL: str = "text-embedding-004"
+    EMBEDDING_PROVIDER: Optional[str] = None
     
     # Neo4j
     NEO4J_URI: str = "bolt://neo4j:7687"

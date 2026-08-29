@@ -1,16 +1,24 @@
 """
-Regulatory Compliance Graph Population Service (Phase 2, Step 4.1).
+Regulatory Compliance Graph & Vector Population Service (Phase 2, Step 4.3).
 
-Responsible for taking extracted regulatory obligations and populating them into Neo4j:
-1. Creates / merges the RegulatoryFramework node if it doesn't exist.
-2. Creates / merges the RegulatoryVersion node if it doesn't exist.
-3. Connects Framework -> Version using (RegulatoryFramework)-[:HAS_VERSION]->(RegulatoryVersion).
-4. Creates / merges a RegulatoryObligation node for each extracted obligation.
-5. Generates deterministic unique IDs (UUIDv5) for each obligation using framework + version + clause.
-6. Connects Version -> Obligation using (RegulatoryVersion)-[:CONTAINS]->(RegulatoryObligation).
-7. If an obligation has a known category, creates/finds the ControlCategory node and connects
-   it using (RegulatoryObligation)-[:CATEGORIZED_AS]->(ControlCategory).
-8. Uses MERGE and existing constraints to avoid duplicates and ensure full idempotency.
+Responsible for taking extracted regulatory obligations and populating them into both:
+1. Neo4j Graph Database:
+   - Creates / merges the RegulatoryFramework node if it doesn't exist.
+   - Creates / merges the RegulatoryVersion node if it doesn't exist.
+   - Connects Framework -> Version using (RegulatoryFramework)-[:HAS_VERSION]->(RegulatoryVersion).
+   - Creates / merges a RegulatoryObligation node for each extracted obligation.
+   - Generates deterministic unique IDs (UUIDv5) for each obligation using framework + version + clause.
+   - Connects Version -> Obligation using (RegulatoryVersion)-[:CONTAINS]->(RegulatoryObligation).
+   - If an obligation has a known category, creates/finds the ControlCategory node and connects
+     it using (RegulatoryObligation)-[:CATEGORIZED_AS]->(ControlCategory).
+   - Uses MERGE and existing constraints to avoid duplicates and ensure full idempotency.
+
+2. Qdrant Vector Database:
+   - Generates vector embeddings for each obligation text using configured provider
+     (Gemini text-embedding-004, FastEmbed, or deterministic local fallback).
+   - Stores vectors in Qdrant collection alongside rich metadata (framework, version, clause, category, text, etc.).
+   - Preserves the EXACT same deterministic unique ID in Qdrant point IDs as in Neo4j nodes.
+   - Ensures full idempotency across multiple runs.
 """
 
 import logging
@@ -20,6 +28,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from uuid import UUID, uuid4
 
 from app.integrations.neo4j_client import Neo4jClient
+from app.integrations.qdrant_client import (
+    QdrantClient,
+    qdrant_client as global_qdrant_client,
+)
 from app.schemas.extraction import ExtractedObligation
 from app.schemas.graph_models import (
     ControlCategory,
@@ -29,7 +41,10 @@ from app.schemas.graph_models import (
     RegulatoryObligation,
     RegulatoryVersion,
 )
-from app.services.graph_service import GraphService, graph_service as global_graph_service
+from app.services.graph_service import (
+    GraphService,
+    graph_service as global_graph_service,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -136,35 +151,41 @@ def generate_category_id(
 
 class GraphPopulator:
     """
-    Graph population service for putting extracted regulatory obligations into Neo4j.
+    Unified population service for putting extracted regulatory obligations into
+    both Neo4j graph relationships and Qdrant vector embeddings.
 
     Provides end-to-end idempotent population:
-    - Creates/merges RegulatoryFramework
-    - Creates/merges RegulatoryVersion
-    - Creates (Framework)-[:HAS_VERSION]->(Version)
-    - Creates/merges RegulatoryObligation with deterministic UUIDs
-    - Creates (Version)-[:CONTAINS]->(Obligation)
-    - Creates/merges ControlCategory (if category is present)
-    - Creates (Obligation)-[:CATEGORIZED_AS]->(ControlCategory)
+    - Creates/merges RegulatoryFramework in Neo4j
+    - Creates/merges RegulatoryVersion in Neo4j
+    - Creates (Framework)-[:HAS_VERSION]->(Version) in Neo4j
+    - Creates/merges RegulatoryObligation with deterministic UUIDs in Neo4j
+    - Creates (Version)-[:CONTAINS]->(Obligation) in Neo4j
+    - Creates/merges ControlCategory (if category is present) in Neo4j
+    - Creates (Obligation)-[:CATEGORIZED_AS]->(ControlCategory) in Neo4j
+    - Generates embeddings and indexes obligations in Qdrant with identical deterministic IDs
     """
 
     def __init__(
         self,
         graph_service: Optional[GraphService] = None,
-        client: Optional[Neo4jClient] = None,
+        qdrant_client: Optional[QdrantClient] = None,
+        neo4j_client: Optional[Neo4jClient] = None,
     ):
         """
-        Initialize GraphPopulator.
+        Initialize GraphPopulator with graph and vector services.
 
         :param graph_service: Optional custom GraphService instance
-        :param client: Optional custom Neo4jClient instance
+        :param qdrant_client: Optional custom QdrantClient instance
+        :param neo4j_client: Optional custom Neo4jClient instance
         """
         if graph_service is not None:
             self.graph_service = graph_service
-        elif client is not None:
-            self.graph_service = GraphService(client=client)
+        elif neo4j_client is not None:
+            self.graph_service = GraphService(client=neo4j_client)
         else:
             self.graph_service = global_graph_service
+
+        self.qdrant_client = qdrant_client or global_qdrant_client
 
     # -------------------------------------------------------------------------
     # Input Normalization Helpers
@@ -318,15 +339,27 @@ class GraphPopulator:
             keywords = list(item["keywords"])
 
         # Extract code and title
-        code: str = clause or (item.get("code") if isinstance(item, dict) else getattr(item, "code", None)) or f"REQ-{uuid4().hex[:8].upper()}"
+        code: str = (
+            clause
+            or (item.get("code") if isinstance(item, dict) else getattr(item, "code", None))
+            or f"REQ-{uuid4().hex[:8].upper()}"
+        )
         code = str(code).strip()
 
-        title: Optional[str] = getattr(item, "title", None) if hasattr(item, "title") else (item.get("title") if isinstance(item, dict) else None)
+        title: Optional[str] = (
+            getattr(item, "title", None)
+            if hasattr(item, "title")
+            else (item.get("title") if isinstance(item, dict) else None)
+        )
         if not title:
             title = f"[{category}] {code}" if category else code
         title = str(title).strip()[:255]
 
-        source_text: Optional[str] = getattr(item, "source_text", None) if hasattr(item, "source_text") else (item.get("source_text") if isinstance(item, dict) else None)
+        source_text: Optional[str] = (
+            getattr(item, "source_text", None)
+            if hasattr(item, "source_text")
+            else (item.get("source_text") if isinstance(item, dict) else None)
+        )
 
         # Generate deterministic unique ID for the obligation
         obligation_id = generate_obligation_id(
@@ -362,7 +395,7 @@ class GraphPopulator:
         return obligation_node, category_node
 
     # -------------------------------------------------------------------------
-    # Main Population Pipeline
+    # Main Population Pipeline (Neo4j Graph + Qdrant Vector Embeddings)
     # -------------------------------------------------------------------------
 
     async def populate(
@@ -370,39 +403,51 @@ class GraphPopulator:
         framework: Union[RegulatoryFramework, Any, Dict[str, Any], str],
         version: Union[RegulatoryVersion, Any, Dict[str, Any], str],
         obligations: Sequence[Union[ExtractedObligation, RegulatoryObligation, Dict[str, Any], Any]],
+        populate_vector: bool = True,
+        collection_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Populate framework, version, obligations, categories, and relationships into Neo4j.
+        Populate framework, version, obligations, categories, and relationships into Neo4j
+        and index vector embeddings with preserved deterministic IDs into Qdrant.
 
         :param framework: Regulatory framework (model, dict, or name string)
         :param version: Regulatory version (model, dict, or version slug string)
         :param obligations: Sequence of extracted obligations
-        :return: Summary dictionary containing created/merged nodes and relationships
+        :param populate_vector: Whether to index vector embeddings in Qdrant (default: True)
+        :param collection_name: Optional Qdrant collection name override
+        :return: Summary dictionary containing created/merged Neo4j graph nodes/edges and Qdrant vector indexing stats
         """
-        logger.info("Starting graph population into Neo4j...")
+        logger.info("Starting unified Graph + Vector population pipeline...")
 
-        # 1. Create the RegulatoryFramework node if it doesn't exist
+        # ---------------------------------------------------------------------
+        # 1. Neo4j Graph Population
+        # ---------------------------------------------------------------------
+
+        # 1.1 Create RegulatoryFramework node if it doesn't exist
         framework_node = self._normalize_framework(framework)
         fw_result = await self.graph_service.upsert_framework(framework_node)
-        logger.info(f"Upserted RegulatoryFramework node: {framework_node.name} (id={framework_node.id})")
+        logger.info(f"Upserted RegulatoryFramework node in Neo4j: {framework_node.name} (id={framework_node.id})")
 
-        # 2. Create the RegulatoryVersion node if it doesn't exist
+        # 1.2 Create RegulatoryVersion node if it doesn't exist
         version_node = self._normalize_version(version, framework_id=framework_node.id)
         ver_result = await self.graph_service.upsert_version(version_node)
-        logger.info(f"Upserted RegulatoryVersion node: {version_node.version_slug} (id={version_node.id})")
+        logger.info(f"Upserted RegulatoryVersion node in Neo4j: {version_node.version_slug} (id={version_node.id})")
 
-        # 3. Connect Framework -> Version using HAS_VERSION
+        # 1.3 Connect Framework -> Version using HAS_VERSION
         has_version_rel = await self.graph_service.link_framework_version(
             framework_id=framework_node.id,
             version_id=version_node.id,
         )
-        logger.info(f"Connected (Framework:{framework_node.name})-[:HAS_VERSION]->(Version:{version_node.version_slug})")
+        logger.info(
+            f"Connected (Framework:{framework_node.name})-[:HAS_VERSION]->(Version:{version_node.version_slug})"
+        )
 
-        # 4. Create RegulatoryObligation nodes & relationships
+        # 1.4 Process and Upsert Obligations, Categories, and Relationships in Neo4j
         populated_obligations: List[Dict[str, Any]] = []
         populated_categories: Dict[str, Dict[str, Any]] = {}
         contains_relationships: List[Dict[str, Any]] = []
         categorized_relationships: List[Dict[str, Any]] = []
+        normalized_obligations: List[Tuple[RegulatoryObligation, Optional[ControlCategory]]] = []
 
         for item in obligations:
             obligation_node, category_node = self._normalize_obligation(
@@ -410,19 +455,20 @@ class GraphPopulator:
                 framework_node=framework_node,
                 version_node=version_node,
             )
+            normalized_obligations.append((obligation_node, category_node))
 
             # Upsert RegulatoryObligation node
             ob_result = await self.graph_service.upsert_obligation(obligation_node)
             populated_obligations.append(ob_result)
 
-            # 6. Connect Version -> Obligation using CONTAINS
+            # Connect Version -> Obligation (CONTAINS)
             contains_rel = await self.graph_service.link_version_obligation(
                 version_id=version_node.id,
                 obligation_id=obligation_node.id,
             )
             contains_relationships.append(contains_rel)
 
-            # 7. If obligation has a known category, create/find ControlCategory & connect via CATEGORIZED_AS
+            # If obligation has a category, create/find ControlCategory & connect via CATEGORIZED_AS
             if category_node:
                 cat_id_str = str(category_node.id)
                 if cat_id_str not in populated_categories:
@@ -437,9 +483,60 @@ class GraphPopulator:
                 categorized_relationships.append(cat_rel)
 
         logger.info(
-            f"Successfully populated graph: framework='{framework_node.name}', "
+            f"Neo4j graph population complete: framework='{framework_node.name}', "
             f"version='{version_node.version_slug}', obligations={len(populated_obligations)}, "
             f"categories={len(populated_categories)}"
+        )
+
+        # ---------------------------------------------------------------------
+        # 2. Qdrant Vector Population (Embeddings & Deterministic IDs)
+        # ---------------------------------------------------------------------
+        vector_indexing_result: Optional[Dict[str, Any]] = None
+
+        if populate_vector and normalized_obligations:
+            logger.info(
+                f"Indexing {len(normalized_obligations)} obligations in Qdrant with preserved deterministic IDs..."
+            )
+            qdrant_items: List[Dict[str, Any]] = []
+
+            for ob_node, _ in normalized_obligations:
+                # Prepare payload ensuring identical deterministic ID is preserved
+                qdrant_items.append({
+                    "obligation_id": str(ob_node.id),
+                    "id": str(ob_node.id),
+                    "framework": framework_node.name,
+                    "version": version_node.version_slug,
+                    "clause": ob_node.clause or ob_node.code,
+                    "category": ob_node.category,
+                    "title": ob_node.title,
+                    "text": ob_node.description or ob_node.title,
+                    "mandatory": ob_node.mandatory,
+                    "keywords": ob_node.keywords,
+                })
+
+            try:
+                vector_indexing_result = await self.qdrant_client.upsert_obligations_batch(
+                    obligations=qdrant_items,
+                    default_framework=framework_node.name,
+                    default_version=version_node.version_slug,
+                    collection_name=collection_name,
+                )
+                logger.info(
+                    f"Successfully indexed {vector_indexing_result.get('count', 0)} vector embeddings in Qdrant."
+                )
+            except Exception as qdrant_err:
+                logger.error(f"Error during Qdrant vector indexing: {qdrant_err}", exc_info=True)
+                vector_indexing_result = {
+                    "success": False,
+                    "error": str(qdrant_err),
+                    "count": 0,
+                }
+
+        # ---------------------------------------------------------------------
+        # 3. Return Combined Summary
+        # ---------------------------------------------------------------------
+        vectors_indexed_count = (
+            vector_indexing_result.get("count", 0) if vector_indexing_result else 0
         )
 
         return {
@@ -453,45 +550,96 @@ class GraphPopulator:
                 "CONTAINS": contains_relationships,
                 "CATEGORIZED_AS": categorized_relationships,
             },
+            "vector_indexing": vector_indexing_result,
             "counts": {
                 "frameworks": 1,
                 "versions": 1,
                 "obligations": len(populated_obligations),
                 "categories": len(populated_categories),
                 "relationships_total": 1 + len(contains_relationships) + len(categorized_relationships),
+                "vectors_indexed": vectors_indexed_count,
             },
         }
 
     # -------------------------------------------------------------------------
-    # Convenience Aliases
+    # Convenience Aliases & Query Methods
     # -------------------------------------------------------------------------
+
+    async def search_similar_obligations(
+        self,
+        query_text: Optional[str] = None,
+        query_vector: Optional[List[float]] = None,
+        framework: Optional[str] = None,
+        version: Optional[str] = None,
+        category: Optional[str] = None,
+        limit: int = 5,
+        score_threshold: Optional[float] = None,
+        collection_name: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Perform semantic similarity vector search across indexed obligations in Qdrant.
+        """
+        return await self.qdrant_client.search_similar_obligations(
+            query_text=query_text,
+            query_vector=query_vector,
+            framework=framework,
+            version=version,
+            category=category,
+            limit=limit,
+            score_threshold=score_threshold,
+            collection_name=collection_name,
+        )
 
     async def populate_obligations(
         self,
         framework: Union[RegulatoryFramework, Any, Dict[str, Any], str],
         version: Union[RegulatoryVersion, Any, Dict[str, Any], str],
         obligations: Sequence[Union[ExtractedObligation, RegulatoryObligation, Dict[str, Any], Any]],
+        populate_vector: bool = True,
+        collection_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Convenience alias for populate."""
-        return await self.populate(framework=framework, version=version, obligations=obligations)
+        return await self.populate(
+            framework=framework,
+            version=version,
+            obligations=obligations,
+            populate_vector=populate_vector,
+            collection_name=collection_name,
+        )
 
     async def populate_framework_obligations(
         self,
         framework: Union[RegulatoryFramework, Any, Dict[str, Any], str],
         version: Union[RegulatoryVersion, Any, Dict[str, Any], str],
         obligations: Sequence[Union[ExtractedObligation, RegulatoryObligation, Dict[str, Any], Any]],
+        populate_vector: bool = True,
+        collection_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Convenience alias for populate."""
-        return await self.populate(framework=framework, version=version, obligations=obligations)
+        return await self.populate(
+            framework=framework,
+            version=version,
+            obligations=obligations,
+            populate_vector=populate_vector,
+            collection_name=collection_name,
+        )
 
     async def populate_graph(
         self,
         framework: Union[RegulatoryFramework, Any, Dict[str, Any], str],
         version: Union[RegulatoryVersion, Any, Dict[str, Any], str],
         obligations: Sequence[Union[ExtractedObligation, RegulatoryObligation, Dict[str, Any], Any]],
+        populate_vector: bool = True,
+        collection_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Convenience alias for populate."""
-        return await self.populate(framework=framework, version=version, obligations=obligations)
+        return await self.populate(
+            framework=framework,
+            version=version,
+            obligations=obligations,
+            populate_vector=populate_vector,
+            collection_name=collection_name,
+        )
 
 
 # Global singleton instance for application usage

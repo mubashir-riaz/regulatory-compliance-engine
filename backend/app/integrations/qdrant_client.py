@@ -336,20 +336,32 @@ class QdrantClient:
     def _generate_local_deterministic_embedding(text: str, dim: int = DEFAULT_VECTOR_SIZE) -> List[float]:
         """
         Generate a deterministic, L2-normalized pseudo-embedding vector for offline/testing scenarios.
+        Uses term and subword n-gram hashing so overlapping terminology produces strong cosine similarity.
         """
         if not text:
             return [0.0] * dim
 
-        vector = [0.0] * dim
-        words = text.lower().split()
-        for idx, word in enumerate(words):
-            h = hashlib.sha256(f"{word}:{idx % 32}".encode("utf-8")).digest()
-            for i in range(min(len(h), dim)):
-                bucket = (int.from_bytes(h[i : i + 2], "big") if i + 2 <= len(h) else h[i]) % dim
-                val = (h[i] - 128) / 128.0
-                vector[bucket] += val
+        import re
+        clean_text = text.lower()
+        words = re.findall(r"\b\w+\b", clean_text)
+        if not words:
+            return [0.0] * dim
 
-        # Normalize vector to unit length (L2 norm) for cosine distance
+        vector = [0.0] * dim
+        # 1. Word token hashing
+        for word in words:
+            h = hashlib.sha256(word.encode("utf-8")).digest()
+            bucket = int.from_bytes(h[:4], "big") % dim
+            vector[bucket] += 1.0
+
+        # 2. Subword 3-gram hashing
+        for i in range(len(clean_text) - 2):
+            ngram = clean_text[i : i + 3]
+            h = hashlib.md5(ngram.encode("utf-8")).digest()
+            bucket = int.from_bytes(h[:4], "big") % dim
+            vector[bucket] += 0.2
+
+        # 3. Normalize vector to unit length (L2 norm) for cosine distance
         norm = math.sqrt(sum(x * x for x in vector))
         if norm > 0:
             vector = [x / norm for x in vector]

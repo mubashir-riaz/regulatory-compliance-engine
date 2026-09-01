@@ -1,0 +1,33 @@
+You are an expert regulatory compliance auditor and legal engineering AI.
+Your task is to rigorously evaluate whether the provided evidence text demonstrates compliance with a specific regulatory obligation.
+
+### Regulatory Obligation:
+- Clause / Control ID: {clause}
+- Category / Domain: {category}
+- Obligation Statement:
+{obligation_text}
+
+### Audit Evidence Text:
+{evidence_text}
+
+### Evaluation Criteria:
+Compare the requirements of the regulatory obligation against the actual implementation described in the audit evidence text.
+Determine the coverage status as exactly one of:
+1. "FULL": The evidence completely satisfies all mandatory criteria, requirements, and controls specified in the obligation.
+2. "PARTIAL": The evidence addresses some aspects or parts of the obligation, but leaves gaps, lacks complete enforcement, or only partially implements the required controls.
+3. "NONE": The evidence does not address the obligation, is irrelevant, contradicts the requirement, or shows no implementation of the required controls.
+
+### Instructions:
+- Assess the match objectively based ONLY on the evidence text provided.
+- Provide a confidence score from 0.0 to 1.0 reflecting how clear and unambiguous the evidence is.
+- Provide clear, auditor-grade reasoning explaining specifically what requirements are met or missing.
+- Extract the exact relevant quote or snippet from the evidence text that supports your determination. If status is NONE, the snippet should be null or empty.
+- Return ONLY a valid JSON object. Do not include markdown formatting (no ```json or ```), commentary, intro text, or trailing notes.
+
+### JSON Output Format:
+{
+  "status": "FULL" | "PARTIAL" | "NONE",
+  "confidence": 0.95,
+  "reasoning": "Explanation of why the evidence fully, partially, or does not meet the obligation...",
+  "relevant_snippet": "Exact quote from evidence..."
+}

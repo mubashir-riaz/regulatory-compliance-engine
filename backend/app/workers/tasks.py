@@ -19,12 +19,16 @@ from app.repositories.framework_repo import (
     RegulatoryRequirementRepository,
     RegulatoryVersionRepository,
 )
+from app.integrations.qdrant_client import QdrantClient, qdrant_client
+from app.schemas.coverage import CoverageAssessmentResult, CoverageStatus
 from app.schemas.extraction import ExtractedObligation
 from app.schemas.graph_models import (
     ControlCategory as Neo4jControlCategory,
+    EvidenceArtifact as Neo4jEvidenceArtifact,
     RegulatoryObligation as Neo4jRegulatoryObligation,
     RegulatoryVersion as Neo4jRegulatoryVersion,
 )
+from app.services.coverage_service import CoverageService, coverage_service
 from app.services.extraction_service import ExtractionService, extraction_service
 from app.services.file_processor import FileProcessor
 from app.services.graph_service import GraphService, graph_service
@@ -88,10 +92,13 @@ async def _process_document_pipeline(
     file_path: str,
     version_id: Optional[str] = None,
     provider: Optional[str] = None,
+    trigger_coverage: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Async implementation of the document processing pipeline.
-    Extracts text/metadata from file, saves to DB, and optionally triggers obligation extraction.
+    Extracts text/metadata from file, saves to DB, and automatically triggers:
+    - regulatory obligation extraction if version_id is provided, OR
+    - evidence coverage mapping (Phase 2, Step 5.3) for audit evidence artifacts.
     """
     logger.info(f"Starting background processing pipeline for document_id={document_id}, file_path={file_path}")
 
@@ -137,6 +144,16 @@ async def _process_document_pipeline(
                 provider=provider,
             )
             pipeline_result["extraction"] = extraction_result
+
+        # 4. If trigger_coverage is requested or this is an evidence document (no version_id), trigger coverage mapping
+        should_map_coverage = trigger_coverage is True or (trigger_coverage is None and not version_id)
+        if should_map_coverage:
+            logger.info(f"Triggering automatic coverage mapping for document_id={document_id}")
+            coverage_result = await _map_evidence_coverage_pipeline(
+                document_id=document_id,
+                provider=provider,
+            )
+            pipeline_result["coverage"] = coverage_result
 
         return pipeline_result
 
@@ -357,6 +374,270 @@ async def _extract_regulatory_obligations_pipeline(
         }
 
 
+async def _map_evidence_coverage_pipeline(
+    document_id: str,
+    framework: Optional[str] = None,
+    version: Optional[str] = None,
+    category: Optional[str] = None,
+    limit: int = 10,
+    score_threshold: Optional[float] = None,
+    provider: Optional[str] = None,
+    custom_coverage_service: Optional[CoverageService] = None,
+    custom_graph_service: Optional[GraphService] = None,
+    custom_qdrant_client: Optional[QdrantClient] = None,
+) -> Dict[str, Any]:
+    """
+    Async pipeline for evidence coverage mapping (Phase 2, Step 5.3).
+
+    Workflow:
+    1. Fetch EvidenceArtifact text from PostgreSQL / local file.
+    2. Ensure EvidenceArtifact node exists in Neo4j.
+    3. Retrieve candidate regulatory obligations:
+       - Uses Qdrant vector similarity search to narrow candidates.
+       - Falls back gracefully to PostgreSQL / Neo4j if vector search is empty or offline.
+    4. Call CoverageService for each candidate obligation to determine coverage status (FULL, PARTIAL, NONE).
+    5. Store the resulting SATISFIES relationship in Neo4j with confidence, reasoning,
+       coverage status, and supporting evidence text.
+    6. Uses Cypher MERGE to avoid duplicate relationships on retries and isolates
+       individual assessment failures so the entire mapping job succeeds.
+
+    :param document_id: ID of the EvidenceArtifact
+    :param framework: Optional framework filter (e.g. 'SOC 2')
+    :param version: Optional version filter (e.g. '2017')
+    :param category: Optional category filter (e.g. 'Access Control')
+    :param limit: Maximum candidate obligations to evaluate (default: 10)
+    :param score_threshold: Minimum vector similarity threshold
+    :param provider: LLM provider override ('groq' or 'gemini')
+    :param custom_coverage_service: Optional CoverageService instance (for testing)
+    :param custom_graph_service: Optional GraphService instance (for testing)
+    :param custom_qdrant_client: Optional QdrantClient instance (for testing)
+    :return: Pipeline execution summary dictionary
+    """
+    logger.info(f"Starting evidence coverage mapping pipeline for document_id={document_id}")
+
+    try:
+        doc_uuid = UUID(document_id)
+    except (ValueError, TypeError) as err:
+        logger.error(f"Invalid UUID in coverage mapping pipeline: {err}")
+        return {"status": STATUS_FAILED, "error": f"Invalid UUID: {err}"}
+
+    srv_coverage = custom_coverage_service or coverage_service
+    srv_graph = custom_graph_service or graph_service
+    srv_qdrant = custom_qdrant_client if custom_qdrant_client is not None else qdrant_client
+
+    # 1. Fetch EvidenceArtifact from PostgreSQL
+    async with AsyncSessionLocal() as session:
+        evidence_repo = EvidenceArtifactRepository(session)
+        artifact = await evidence_repo.get_by_id(doc_uuid)
+        if not artifact:
+            logger.error(f"EvidenceArtifact {document_id} not found in database.")
+            return {"status": STATUS_FAILED, "error": f"EvidenceArtifact {document_id} not found"}
+
+        evidence_text = artifact.extracted_text
+        if not evidence_text or not evidence_text.strip():
+            # Parse from file if text not yet populated in DB
+            if artifact.file_path:
+                logger.info(f"Artifact {document_id} has no extracted text. Parsing from file_path={artifact.file_path}...")
+                proc = FileProcessor()
+                proc_res = proc.process_file(artifact.file_path)
+                evidence_text = proc_res.get("text", "")
+                if evidence_text:
+                    await evidence_repo.update(artifact, {"extracted_text": evidence_text})
+
+        if not evidence_text or not evidence_text.strip():
+            logger.warning(f"No text content available in document {document_id} for coverage assessment.")
+            return {
+                "status": STATUS_COMPLETED,
+                "document_id": document_id,
+                "candidates_found": 0,
+                "assessments_completed": 0,
+                "assessments_failed": 0,
+                "successful_mappings": [],
+                "failed_assessments": [],
+                "message": "No text content available in document.",
+            }
+
+        # 2. Ensure EvidenceArtifact node exists in Neo4j
+        try:
+            neo4j_evidence = Neo4jEvidenceArtifact(
+                id=artifact.id,
+                organization_id=artifact.organization_id,
+                name=artifact.name,
+                file_path=artifact.file_path,
+                file_size=artifact.file_size,
+                mime_type=artifact.mime_type,
+                status=artifact.status or "COMPLETED",
+            )
+            await srv_graph.upsert_evidence_artifact(neo4j_evidence)
+        except Exception as graph_err:
+            logger.warning(f"Could not upsert EvidenceArtifact in Neo4j (non-fatal): {graph_err}")
+
+        # 3. Retrieve Candidate Regulatory Obligations
+        candidates: List[Dict[str, Any]] = []
+        query_excerpt = evidence_text[:4000].strip()
+
+        # Strategy A: Use Qdrant similarity search to narrow candidates
+        try:
+            if srv_qdrant is not None:
+                qdrant_results = await srv_qdrant.search_similar_obligations(
+                    query_text=query_excerpt,
+                    framework=framework,
+                    version=version,
+                    category=category,
+                    limit=limit,
+                    score_threshold=score_threshold,
+                )
+                if qdrant_results:
+                    candidates = qdrant_results
+                    logger.info(
+                        f"Retrieved {len(candidates)} candidate obligations from Qdrant vector search "
+                        f"for document {document_id}."
+                    )
+        except Exception as qdrant_err:
+            logger.warning(
+                f"Qdrant similarity search failed ({qdrant_err}). Falling back to database/graph lookup.",
+                exc_info=True,
+            )
+
+        # Strategy B: Fallback to PostgreSQL or Neo4j if Qdrant returned no candidates
+        if not candidates:
+            logger.info("No candidates returned from Qdrant. Checking PostgreSQL / Neo4j obligations fallback...")
+            req_repo = RegulatoryRequirementRepository(session)
+            requirements = await req_repo.list(limit=limit)
+            if requirements:
+                for r in requirements:
+                    candidates.append({
+                        "obligation_id": str(r.id),
+                        "clause": r.code,
+                        "title": r.title,
+                        "text": r.description or r.title,
+                        "category": None,
+                        "framework": framework,
+                        "version": version,
+                        "score": 1.0,
+                    })
+                logger.info(f"Retrieved {len(candidates)} candidate obligations from PostgreSQL.")
+            else:
+                try:
+                    query = """
+                    MATCH (o:RegulatoryObligation)
+                    RETURN o.id AS obligation_id, o.code AS clause, o.title AS title,
+                           o.description AS text, o.category AS category
+                    LIMIT $limit
+                    """
+                    neo4j_obs = await srv_graph.execute_query(query, parameters={"limit": limit})
+                    for no in neo4j_obs:
+                        candidates.append({
+                            "obligation_id": str(no.get("obligation_id")),
+                            "clause": no.get("clause"),
+                            "title": no.get("title"),
+                            "text": no.get("text") or no.get("title"),
+                            "category": no.get("category"),
+                            "framework": framework,
+                            "version": version,
+                            "score": 1.0,
+                        })
+                    logger.info(f"Retrieved {len(candidates)} candidate obligations from Neo4j.")
+                except Exception as neo_err:
+                    logger.warning(f"Neo4j fallback obligation query failed: {neo_err}")
+
+        if not candidates:
+            logger.warning(f"No candidate obligations found in system for document {document_id}.")
+            return {
+                "status": STATUS_COMPLETED,
+                "document_id": document_id,
+                "candidates_found": 0,
+                "assessments_completed": 0,
+                "assessments_failed": 0,
+                "successful_mappings": [],
+                "failed_assessments": [],
+                "message": "No candidate obligations found in system.",
+            }
+
+        # 4. Assess Coverage and Persist SATISFIES Relationships
+        successful_mappings: List[Dict[str, Any]] = []
+        failed_assessments: List[Dict[str, Any]] = []
+
+        for idx, cand in enumerate(candidates):
+            cand_id = cand.get("obligation_id") or cand.get("id")
+            if not cand_id:
+                continue
+
+            clause = cand.get("clause") or cand.get("code") or ""
+            cand_text = cand.get("text") or cand.get("description") or cand.get("title") or ""
+            cat = cand.get("category")
+            meta = cand.get("payload") if isinstance(cand.get("payload"), dict) else cand
+
+            logger.info(
+                f"Assessing coverage ({idx + 1}/{len(candidates)}): "
+                f"document_id={document_id} -> obligation_id={cand_id} ({clause})..."
+            )
+
+            try:
+                # Call CoverageService
+                assessment_res: CoverageAssessmentResult = await srv_coverage.assess_coverage(
+                    evidence_text=evidence_text,
+                    obligation_text=cand_text,
+                    clause=clause,
+                    category=cat,
+                    metadata=meta,
+                    provider=provider,
+                    use_fallback=True,
+                )
+
+                # Store SATISFIES relationship in Neo4j idempotently via MERGE
+                rel = await srv_graph.store_coverage_assessment(
+                    evidence_id=doc_uuid,
+                    obligation_id=cand_id,
+                    assessment=assessment_res,
+                    evidence_text=assessment_res.relevant_snippet or evidence_text[:1000],
+                    create_nodes_if_missing=True,
+                )
+
+                successful_mappings.append({
+                    "obligation_id": str(cand_id),
+                    "clause": clause,
+                    "status": assessment_res.status.value,
+                    "confidence": assessment_res.confidence,
+                    "reasoning": assessment_res.reasoning,
+                    "relevant_snippet": assessment_res.relevant_snippet,
+                    "rel_type": rel.get("rel_type", "SATISFIES"),
+                })
+                logger.info(
+                    f"Successfully stored SATISFIES edge: doc={document_id} -> ob={cand_id}, "
+                    f"status={assessment_res.status.value}, confidence={assessment_res.confidence:.2f}"
+                )
+
+            except Exception as cand_err:
+                logger.error(
+                    f"Coverage assessment failed for obligation {cand_id} ({clause}): {cand_err}",
+                    exc_info=True,
+                )
+                failed_assessments.append({
+                    "obligation_id": str(cand_id),
+                    "clause": clause,
+                    "error": str(cand_err),
+                })
+                # Isolate failure so other candidates continue
+                continue
+
+        logger.info(
+            f"Coverage mapping completed for document {document_id}: "
+            f"candidates={len(candidates)}, successful={len(successful_mappings)}, "
+            f"failed={len(failed_assessments)}"
+        )
+
+        return {
+            "status": STATUS_COMPLETED,
+            "document_id": document_id,
+            "candidates_found": len(candidates),
+            "assessments_completed": len(successful_mappings),
+            "assessments_failed": len(failed_assessments),
+            "successful_mappings": successful_mappings,
+            "failed_assessments": failed_assessments,
+        }
+
+
 # -----------------------------------------------------------------------------
 # Celery Tasks
 # -----------------------------------------------------------------------------
@@ -368,10 +649,12 @@ def process_document_task(
     file_path: str,
     version_id: Optional[str] = None,
     provider: Optional[str] = None,
+    trigger_coverage: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Background Celery task to parse uploaded file, extract text, save to EvidenceArtifact,
-    and optionally trigger regulatory obligation extraction if version_id is provided.
+    and automatically trigger obligation extraction (if version_id provided) or
+    coverage mapping against candidate obligations.
     """
     return asyncio.run(
         _process_document_pipeline(
@@ -379,6 +662,7 @@ def process_document_task(
             file_path=file_path,
             version_id=version_id,
             provider=provider,
+            trigger_coverage=trigger_coverage,
         )
     )
 
@@ -400,4 +684,55 @@ def extract_regulatory_obligations_task(
             version_id=version_id,
             provider=provider,
         )
+    )
+
+
+@celery_app.task(name="app.workers.tasks.map_evidence_coverage_task")
+def map_evidence_coverage_task(
+    document_id: str,
+    framework: Optional[str] = None,
+    version: Optional[str] = None,
+    category: Optional[str] = None,
+    limit: int = 10,
+    score_threshold: Optional[float] = None,
+    provider: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Background Celery task for evidence coverage mapping (Phase 2, Step 5.3).
+    Narrows candidate regulatory obligations using Qdrant similarity search,
+    evaluates coverage for each candidate via CoverageService, and idempotently
+    stores the resulting SATISFIES relationships in Neo4j.
+    """
+    return asyncio.run(
+        _map_evidence_coverage_pipeline(
+            document_id=document_id,
+            framework=framework,
+            version=version,
+            category=category,
+            limit=limit,
+            score_threshold=score_threshold,
+            provider=provider,
+        )
+    )
+
+
+@celery_app.task(name="app.workers.tasks.coverage_mapping_task")
+def coverage_mapping_task(
+    document_id: str,
+    framework: Optional[str] = None,
+    version: Optional[str] = None,
+    category: Optional[str] = None,
+    limit: int = 10,
+    score_threshold: Optional[float] = None,
+    provider: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Alias for map_evidence_coverage_task."""
+    return map_evidence_coverage_task(
+        document_id=document_id,
+        framework=framework,
+        version=version,
+        category=category,
+        limit=limit,
+        score_threshold=score_threshold,
+        provider=provider,
     )

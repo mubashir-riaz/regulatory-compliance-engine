@@ -146,6 +146,15 @@ class SatisfiesRelationship(BaseGraphRelationship):
     rel_type: GraphRelationshipType = GraphRelationshipType.SATISFIES
     similarity_score: Optional[float] = None
     status: Optional[str] = "pending"
+    coverage: Optional[str] = None
+    confidence: Optional[float] = None
+    reasoning: Optional[str] = None
+    evidence_text: Optional[str] = None
+    updated_at: Optional[datetime] = None
+
+    @property
+    def coverage_status(self) -> Optional[str]:
+        return self.coverage
 
 
 class DependsOnRelationship(BaseGraphRelationship):

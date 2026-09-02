@@ -19,6 +19,7 @@ import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from uuid import UUID
 
 import httpx
 
@@ -103,6 +104,7 @@ class CoverageService:
         prompt_path: Optional[Union[str, Path]] = None,
         http_client: Optional[httpx.AsyncClient] = None,
         fallback_enabled: bool = True,
+        graph_service: Optional[Any] = None,
     ):
         """
         Initialize CoverageService.
@@ -113,6 +115,7 @@ class CoverageService:
         :param prompt_path: Custom path to prompt template
         :param http_client: Reusable httpx.AsyncClient
         :param fallback_enabled: If True, uses rule-based fallback when LLM is unavailable
+        :param graph_service: Optional GraphService instance for Neo4j operations
         """
         self.provider = (provider or getattr(settings, "LLM_PROVIDER", "groq")).lower().strip()
         self.groq_api_key = (
@@ -129,6 +132,17 @@ class CoverageService:
         self._http_client = http_client
         self.fallback_enabled = fallback_enabled
         self._prompt_template: Optional[str] = None
+        self._graph_service = graph_service
+
+    @property
+    def graph_service(self) -> Any:
+        """
+        Lazily resolved GraphService instance for Neo4j graph operations.
+        """
+        if self._graph_service is None:
+            from app.services.graph_service import graph_service
+            self._graph_service = graph_service
+        return self._graph_service
 
     # -------------------------------------------------------------------------
     # Prompt Template Management
@@ -699,6 +713,177 @@ class CoverageService:
             confidence=round(confidence, 4),
             reasoning=reasoning,
             relevant_snippet=snippet,
+        )
+
+    # -------------------------------------------------------------------------
+    # Neo4j Graph Integration (Phase 2, Step 5.2)
+    # -------------------------------------------------------------------------
+
+    async def create_satisfies_relationship(
+        self,
+        evidence_id: Union[str, UUID],
+        obligation_id: Union[str, UUID],
+        coverage: Union[str, CoverageStatus],
+        confidence: float,
+        reasoning: str,
+        evidence_text: Optional[str] = None,
+        properties: Optional[Dict[str, Any]] = None,
+        create_nodes_if_missing: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Create or update the SATISFIES relationship in Neo4j between EvidenceArtifact
+        and RegulatoryObligation (Phase 2, Step 5.2).
+
+        Properties stored on the relationship edge:
+        - coverage: FULL, PARTIAL, or NONE
+        - coverage_status: Alias for coverage
+        - confidence: Confidence score (0.0 to 1.0)
+        - reasoning: Auditor-grade rationale
+        - evidence_text: Assessed evidence text or snippet
+        - updated_at: ISO 8601 timestamp
+
+        Uses Cypher MERGE for idempotent updates (prevents duplicate relationships on re-runs).
+
+        :param evidence_id: UUID or string ID of the EvidenceArtifact node
+        :param obligation_id: UUID or string ID of the RegulatoryObligation node
+        :param coverage: Coverage status (FULL, PARTIAL, NONE)
+        :param confidence: Assessment confidence score (0.0 to 1.0)
+        :param reasoning: Explanatory reasoning
+        :param evidence_text: Relevant quote or evidence statement
+        :param properties: Optional additional relationship properties
+        :param create_nodes_if_missing: If True, MERGE nodes if not present
+        :return: Relationship edge dict with rel_type, properties, source_id, target_id
+        """
+        return await self.graph_service.create_satisfies_relationship(
+            evidence_id=evidence_id,
+            obligation_id=obligation_id,
+            coverage=coverage,
+            confidence=confidence,
+            reasoning=reasoning,
+            evidence_text=evidence_text,
+            properties=properties,
+            create_nodes_if_missing=create_nodes_if_missing,
+        )
+
+    async def store_coverage_assessment(
+        self,
+        evidence_id: Union[str, UUID],
+        obligation_id: Union[str, UUID],
+        assessment: Union[CoverageAssessmentResult, Dict[str, Any]],
+        evidence_text: Optional[str] = None,
+        properties: Optional[Dict[str, Any]] = None,
+        create_nodes_if_missing: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Store a successful coverage assessment in Neo4j as a SATISFIES relationship edge (Phase 2, Step 5.2).
+
+        :param evidence_id: UUID or string ID of the EvidenceArtifact node
+        :param obligation_id: UUID or string ID of the RegulatoryObligation node
+        :param assessment: CoverageAssessmentResult instance or dictionary
+        :param evidence_text: Optional evidence text override (defaults to assessment.relevant_snippet)
+        :param properties: Optional extra properties dictionary
+        :param create_nodes_if_missing: If True, MERGE endpoints if not already in graph
+        :return: Relationship edge dictionary with rel_type, properties, source_id, target_id
+        """
+        return await self.graph_service.store_coverage_assessment(
+            evidence_id=evidence_id,
+            obligation_id=obligation_id,
+            assessment=assessment,
+            evidence_text=evidence_text,
+            properties=properties,
+            create_nodes_if_missing=create_nodes_if_missing,
+        )
+
+    async def store_assessment_in_graph(
+        self,
+        evidence_id: Union[str, UUID],
+        obligation_id: Union[str, UUID],
+        assessment: Union[CoverageAssessmentResult, Dict[str, Any]],
+        evidence_text: Optional[str] = None,
+        properties: Optional[Dict[str, Any]] = None,
+        create_nodes_if_missing: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Convenience alias for store_coverage_assessment.
+        """
+        return await self.store_coverage_assessment(
+            evidence_id=evidence_id,
+            obligation_id=obligation_id,
+            assessment=assessment,
+            evidence_text=evidence_text,
+            properties=properties,
+            create_nodes_if_missing=create_nodes_if_missing,
+        )
+
+    async def assess_and_store(
+        self,
+        evidence_id: Union[str, UUID],
+        obligation_id: Union[str, UUID],
+        evidence_text: str,
+        obligation_text: Union[str, Any],
+        clause: Optional[str] = None,
+        category: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        use_fallback: bool = True,
+        properties: Optional[Dict[str, Any]] = None,
+        create_nodes_if_missing: bool = False,
+    ) -> Tuple[CoverageAssessmentResult, Dict[str, Any]]:
+        """
+        Assess coverage and store the resulting SATISFIES relationship in Neo4j in a single call.
+
+        :param evidence_id: UUID or string ID of the EvidenceArtifact node
+        :param obligation_id: UUID or string ID of the RegulatoryObligation node
+        :param evidence_text: Statement or excerpt of audit evidence
+        :param obligation_text: Obligation requirement text or model
+        :param clause: Optional clause/control ID (e.g. 'CC6.1')
+        :param category: Optional control category (e.g. 'Access Control')
+        :param metadata: Optional metadata dictionary
+        :param provider: LLM provider override ('groq' or 'gemini')
+        :param model: LLM model override
+        :param use_fallback: Whether to fallback to rule-based evaluation
+        :param properties: Optional extra properties for the graph relationship
+        :param create_nodes_if_missing: Whether to create graph nodes if not present
+        :return: Tuple of (CoverageAssessmentResult, relationship dict)
+        """
+        assessment = await self.assess_coverage(
+            evidence_text=evidence_text,
+            obligation_text=obligation_text,
+            clause=clause,
+            category=category,
+            metadata=metadata,
+            provider=provider,
+            model=model,
+            use_fallback=use_fallback,
+        )
+
+        rel = await self.store_coverage_assessment(
+            evidence_id=evidence_id,
+            obligation_id=obligation_id,
+            assessment=assessment,
+            evidence_text=evidence_text,
+            properties=properties,
+            create_nodes_if_missing=create_nodes_if_missing,
+        )
+
+        return assessment, rel
+
+    async def get_satisfies_relationship(
+        self,
+        evidence_id: Union[str, UUID],
+        obligation_id: Union[str, UUID],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve existing SATISFIES relationship between EvidenceArtifact and RegulatoryObligation from Neo4j.
+
+        :param evidence_id: ID of the EvidenceArtifact node
+        :param obligation_id: ID of the RegulatoryObligation node
+        :return: Relationship dictionary if found, else None
+        """
+        return await self.graph_service.get_satisfies_relationship(
+            evidence_id=evidence_id,
+            obligation_id=obligation_id,
         )
 
 

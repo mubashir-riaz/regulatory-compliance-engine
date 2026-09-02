@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Union
 from uuid import UUID
 
 from app.integrations.neo4j_client import Neo4jClient, neo4j_client
+from app.schemas.coverage import CoverageAssessmentResult, CoverageStatus
 from app.schemas.graph_models import (
     GraphNodeLabel,
     GraphRelationshipType,
@@ -171,6 +172,7 @@ class GraphService:
         target_id: Union[str, UUID],
         rel_type: str,
         properties: Optional[Dict[str, Any]] = None,
+        create_nodes_if_missing: bool = False,
     ) -> Dict[str, Any]:
         """
         Idempotently create or update a relationship edge between two nodes.
@@ -181,16 +183,26 @@ class GraphService:
         :param target_id: ID of the target node
         :param rel_type: Relationship type (e.g. 'HAS_VERSION', 'CONTAINS', etc.)
         :param properties: Optional properties to attach to the relationship
+        :param create_nodes_if_missing: If True, MERGE endpoints if not already in graph
         :return: Dict containing rel_type, properties, source_id, and target_id
         """
         clean_props = {k: v for k, v in (properties or {}).items() if v is not None}
-        query = f"""
-        MATCH (s:{source_label} {{id: $source_id}})
-        MATCH (t:{target_label} {{id: $target_id}})
-        MERGE (s)-[r:{rel_type}]->(t)
-        SET r += $properties
-        RETURN type(r) AS rel_type, properties(r) AS properties, s.id AS source_id, t.id AS target_id
-        """
+        if create_nodes_if_missing:
+            query = f"""
+            MERGE (s:{source_label} {{id: $source_id}})
+            MERGE (t:{target_label} {{id: $target_id}})
+            MERGE (s)-[r:{rel_type}]->(t)
+            SET r += $properties
+            RETURN type(r) AS rel_type, properties(r) AS properties, s.id AS source_id, t.id AS target_id
+            """
+        else:
+            query = f"""
+            MATCH (s:{source_label} {{id: $source_id}})
+            MATCH (t:{target_label} {{id: $target_id}})
+            MERGE (s)-[r:{rel_type}]->(t)
+            SET r += $properties
+            RETURN type(r) AS rel_type, properties(r) AS properties, s.id AS source_id, t.id AS target_id
+            """
         params = {
             "source_id": str(source_id),
             "target_id": str(target_id),
@@ -257,15 +269,82 @@ class GraphService:
         evidence_id: Union[str, UUID],
         obligation_id: Union[str, UUID],
         similarity_score: Optional[float] = None,
-        status: str = "approved",
+        status: Optional[str] = "approved",
+        coverage: Optional[Union[str, CoverageStatus]] = None,
+        confidence: Optional[float] = None,
+        reasoning: Optional[str] = None,
+        evidence_text: Optional[str] = None,
+        assessment: Optional[Union[CoverageAssessmentResult, Dict[str, Any]]] = None,
         properties: Optional[Dict[str, Any]] = None,
+        create_nodes_if_missing: bool = False,
     ) -> Dict[str, Any]:
-        """(EvidenceArtifact)-[:SATISFIES]->(RegulatoryObligation)"""
+        """
+        (EvidenceArtifact)-[:SATISFIES]->(RegulatoryObligation)
+
+        Idempotently create or update the SATISFIES relationship.
+        Supports legacy properties (similarity_score, status) as well as Phase 2 Step 5.2
+        coverage assessment properties (coverage, confidence, reasoning, evidence_text).
+        """
         props = dict(properties or {})
         if similarity_score is not None:
             props["similarity_score"] = float(similarity_score)
         if status is not None:
             props["status"] = str(status)
+
+        # Resolve assessment fields if provided
+        resolved_coverage = None
+        resolved_confidence = None
+        resolved_reasoning = None
+        resolved_evidence_text = evidence_text
+
+        if assessment is not None:
+            if hasattr(assessment, "status"):
+                st = assessment.status
+                resolved_coverage = st.value if hasattr(st, "value") else str(st)
+                resolved_confidence = float(assessment.confidence)
+                resolved_reasoning = str(assessment.reasoning)
+                if resolved_evidence_text is None and getattr(assessment, "relevant_snippet", None):
+                    resolved_evidence_text = str(assessment.relevant_snippet)
+            elif isinstance(assessment, dict):
+                st = assessment.get("coverage") or assessment.get("status") or assessment.get("coverage_status")
+                if st is not None:
+                    resolved_coverage = st.value if hasattr(st, "value") else str(st)
+                if assessment.get("confidence") is not None:
+                    resolved_confidence = float(assessment["confidence"])
+                elif assessment.get("confidence_score") is not None:
+                    resolved_confidence = float(assessment["confidence_score"])
+                if assessment.get("reasoning") is not None:
+                    resolved_reasoning = str(assessment["reasoning"])
+                elif assessment.get("explanation") is not None:
+                    resolved_reasoning = str(assessment["explanation"])
+                if resolved_evidence_text is None:
+                    resolved_evidence_text = (
+                        assessment.get("evidence_text")
+                        or assessment.get("relevant_snippet")
+                        or assessment.get("evidence_snippet")
+                    )
+
+        if coverage is not None:
+            resolved_coverage = coverage.value if hasattr(coverage, "value") else str(coverage)
+        if confidence is not None:
+            resolved_confidence = float(confidence)
+        if reasoning is not None:
+            resolved_reasoning = str(reasoning)
+        if evidence_text is not None:
+            resolved_evidence_text = str(evidence_text)
+
+        if resolved_coverage is not None:
+            cov_str = resolved_coverage.upper()
+            props["coverage"] = cov_str
+            props["coverage_status"] = cov_str
+        if resolved_confidence is not None:
+            props["confidence"] = round(float(resolved_confidence), 4)
+        if resolved_reasoning is not None:
+            props["reasoning"] = str(resolved_reasoning)
+        if resolved_evidence_text is not None:
+            props["evidence_text"] = str(resolved_evidence_text)
+
+        props["updated_at"] = datetime.utcnow().isoformat()
 
         return await self.create_relationship(
             source_label=GraphNodeLabel.EVIDENCE.value,
@@ -274,6 +353,136 @@ class GraphService:
             target_id=obligation_id,
             rel_type=GraphRelationshipType.SATISFIES.value,
             properties=props,
+            create_nodes_if_missing=create_nodes_if_missing,
+        )
+
+    async def create_satisfies_relationship(
+        self,
+        evidence_id: Union[str, UUID],
+        obligation_id: Union[str, UUID],
+        coverage: Union[str, CoverageStatus],
+        confidence: float,
+        reasoning: str,
+        evidence_text: Optional[str] = None,
+        properties: Optional[Dict[str, Any]] = None,
+        create_nodes_if_missing: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Create or update the SATISFIES relationship between EvidenceArtifact and RegulatoryObligation (Step 5.2).
+
+        Idempotently merges the relationship edge using Neo4j Cypher MERGE, ensuring re-running
+        the same mapping updates properties without creating duplicate relationships.
+
+        Relationship Properties stored:
+        - coverage: Coverage status ("FULL", "PARTIAL", or "NONE")
+        - coverage_status: Alias for coverage status
+        - confidence: Confidence score (0.0 to 1.0)
+        - reasoning: Detailed auditor-grade justification
+        - evidence_text: Supporting excerpt or evidence statement
+        - updated_at: ISO 8601 timestamp
+
+        :param evidence_id: ID of the EvidenceArtifact node
+        :param obligation_id: ID of the RegulatoryObligation node
+        :param coverage: Coverage determination status (FULL, PARTIAL, or NONE)
+        :param confidence: Assessment confidence score
+        :param reasoning: Explanatory rationale
+        :param evidence_text: Text snippet or evidence content
+        :param properties: Additional optional relationship properties
+        :param create_nodes_if_missing: If True, MERGE nodes if they do not exist
+        :return: Relationship edge dictionary with rel_type, properties, source_id, and target_id
+        """
+        cov_str = coverage.value if hasattr(coverage, "value") else str(coverage).upper()
+        props = dict(properties or {})
+        props.update({
+            "coverage": cov_str,
+            "coverage_status": cov_str,
+            "confidence": round(float(confidence), 4),
+            "reasoning": str(reasoning),
+            "evidence_text": str(evidence_text or ""),
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+
+        return await self.create_relationship(
+            source_label=GraphNodeLabel.EVIDENCE.value,
+            source_id=evidence_id,
+            target_label=GraphNodeLabel.OBLIGATION.value,
+            target_id=obligation_id,
+            rel_type=GraphRelationshipType.SATISFIES.value,
+            properties=props,
+            create_nodes_if_missing=create_nodes_if_missing,
+        )
+
+    async def store_coverage_assessment(
+        self,
+        evidence_id: Union[str, UUID],
+        obligation_id: Union[str, UUID],
+        assessment: Union[CoverageAssessmentResult, Dict[str, Any]],
+        evidence_text: Optional[str] = None,
+        properties: Optional[Dict[str, Any]] = None,
+        create_nodes_if_missing: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Store a successful coverage assessment in Neo4j as a SATISFIES relationship edge (Step 5.2).
+
+        Extracts coverage status, confidence score, reasoning, and evidence text from the
+        provided assessment result, and saves them on the SATISFIES relationship between
+        EvidenceArtifact and RegulatoryObligation using idempotent Cypher MERGE.
+
+        :param evidence_id: UUID or string ID of the EvidenceArtifact node
+        :param obligation_id: UUID or string ID of the RegulatoryObligation node
+        :param assessment: CoverageAssessmentResult instance or dictionary
+        :param evidence_text: Optional evidence text override (defaults to assessment.relevant_snippet)
+        :param properties: Optional extra properties dictionary
+        :param create_nodes_if_missing: If True, MERGE endpoints if not already in graph
+        :return: Relationship edge dictionary
+        """
+        if hasattr(assessment, "status"):
+            cov = assessment.status.value if hasattr(assessment.status, "value") else str(assessment.status)
+            conf = float(assessment.confidence)
+            reas = str(assessment.reasoning)
+            ev_snippet = getattr(assessment, "relevant_snippet", None)
+        elif isinstance(assessment, dict):
+            cov_raw = assessment.get("coverage") or assessment.get("status") or assessment.get("coverage_status") or "NONE"
+            cov = cov_raw.value if hasattr(cov_raw, "value") else str(cov_raw)
+            conf = float(assessment.get("confidence") or assessment.get("confidence_score") or 0.0)
+            reas = str(assessment.get("reasoning") or assessment.get("explanation") or "")
+            ev_snippet = (
+                assessment.get("evidence_text")
+                or assessment.get("relevant_snippet")
+                or assessment.get("evidence_snippet")
+            )
+        else:
+            raise TypeError(f"Invalid assessment type: {type(assessment).__name__}")
+
+        resolved_evidence_text = evidence_text if evidence_text is not None else (ev_snippet or "")
+
+        return await self.create_satisfies_relationship(
+            evidence_id=evidence_id,
+            obligation_id=obligation_id,
+            coverage=cov,
+            confidence=conf,
+            reasoning=reas,
+            evidence_text=resolved_evidence_text,
+            properties=properties,
+            create_nodes_if_missing=create_nodes_if_missing,
+        )
+
+    async def get_satisfies_relationship(
+        self,
+        evidence_id: Union[str, UUID],
+        obligation_id: Union[str, UUID],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve existing SATISFIES relationship between an EvidenceArtifact and RegulatoryObligation.
+
+        :param evidence_id: ID of the EvidenceArtifact node
+        :param obligation_id: ID of the RegulatoryObligation node
+        :return: Relationship dictionary if found, else None
+        """
+        return await self.get_relationship(
+            source_id=evidence_id,
+            target_id=obligation_id,
+            rel_type=GraphRelationshipType.SATISFIES.value,
         )
 
     async def link_obligation_depends_on(

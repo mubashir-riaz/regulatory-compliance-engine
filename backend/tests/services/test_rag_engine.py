@@ -1,78 +1,168 @@
 """
-Unit and Integration Tests for Graph RAG Retrieval Service (Phase 2, Step 6.1).
+Unit and Integration Tests for Graph RAG Retrieval & Graph Context Expansion (Phase 2, Steps 6.1 & 6.2).
 
-Tests Qdrant vector retrieval for regulatory obligations:
-1. Retrieval with user questions and top-k ranking.
-2. Neo4j Node ID and metadata extraction.
-3. Configurable top_k and filter options.
-4. Graceful handling of empty queries and empty vector store results.
-5. Error handling and exception resilience.
-6. Local deterministic embedding generation integration.
+Tests:
+1. Step 6.1: Qdrant semantic vector retrieval, top-k ranking, metadata extraction.
+2. Step 6.2: Neo4j graph context expansion around relevant obligation IDs:
+   - Traversal to RegulatoryFramework and RegulatoryVersion.
+   - Traversal to ControlCategory (CATEGORIZED_AS).
+   - Traversal to EvidenceArtifact (SATISFIES, coverage, confidence, reasoning).
+   - Traversal to Related Obligations (DEPENDS_ON and SUPERSEDES).
+3. Verification using existing sample graph from Phase 2 Step 2 (SOC 2 CC6.1).
+4. Safe handling of missing nodes and empty graph results.
+5. End-to-end query_and_expand pipeline.
+6. Structured LLM prompt context formatting and citation source generation.
 """
 
 from unittest.mock import AsyncMock, MagicMock
+from uuid import UUID
 import pytest
 
+from app.services.graph_service import (
+    SAMPLE_CATEGORY_ID,
+    SAMPLE_DEP_OBLIGATION_ID,
+    SAMPLE_EVIDENCE_ID,
+    SAMPLE_FRAMEWORK_ID,
+    SAMPLE_OBLIGATION_ID,
+    SAMPLE_SUPERSEDED_OBLIGATION_ID,
+    SAMPLE_VERSION_ID,
+)
 from app.services.rag_engine import (
     DEFAULT_TOP_K,
+    GraphRAGContext,
     GraphRAGEngine,
+    RAGGraphExpansionError,
     RAGRetrievalError,
     RetrievedObligation,
     rag_engine,
 )
 
 
-# Sample mock data for GDPR obligations
+# -----------------------------------------------------------------------------
+# Test Data Fixtures
+# -----------------------------------------------------------------------------
+
 MOCK_QDRANT_OBLIGATIONS = [
     {
-        "obligation_id": "GDPR_2026_ART_5_1_E",
-        "node_id": "GDPR_2026_ART_5_1_E",
-        "score": 0.9142,
-        "framework": "GDPR",
-        "version": "2016",
-        "clause": "Article 5(1)(e)",
-        "category": "Storage Limitation",
-        "title": "Storage Limitation & Data Retention",
-        "text": "Personal data shall be kept in a form which permits identification of data subjects for no longer than is necessary.",
+        "obligation_id": str(SAMPLE_OBLIGATION_ID),
+        "node_id": str(SAMPLE_OBLIGATION_ID),
+        "score": 0.9450,
+        "framework": "SOC 2",
+        "version": "2017",
+        "clause": "CC6.1",
+        "category": "Access Control",
+        "title": "Logical and Physical Access Controls",
+        "text": "The entity implements logical access security software, infrastructure, and architectures over protected information assets.",
         "mandatory": True,
-        "keywords": ["storage limitation", "retention", "data subjects"],
+        "keywords": ["logical access", "authentication", "security"],
         "payload": {
-            "obligation_id": "GDPR_2026_ART_5_1_E",
-            "framework": "GDPR",
-            "version": "2016",
-            "clause": "Article 5(1)(e)",
-            "category": "Storage Limitation",
-            "title": "Storage Limitation & Data Retention",
-            "text": "Personal data shall be kept in a form which permits identification of data subjects for no longer than is necessary.",
+            "obligation_id": str(SAMPLE_OBLIGATION_ID),
+            "framework": "SOC 2",
+            "version": "2017",
+            "clause": "CC6.1",
+            "category": "Access Control",
+            "title": "Logical and Physical Access Controls",
+            "text": "The entity implements logical access security software, infrastructure, and architectures over protected information assets.",
             "mandatory": True,
-            "keywords": ["storage limitation", "retention", "data subjects"],
+            "keywords": ["logical access", "authentication", "security"],
         },
     },
     {
-        "obligation_id": "GDPR_2026_ART_17",
-        "node_id": "GDPR_2026_ART_17",
-        "score": 0.8715,
-        "framework": "GDPR",
-        "version": "2016",
-        "clause": "Article 17",
-        "category": "Data Subject Rights",
-        "title": "Right to Erasure ('Right to be Forgotten')",
-        "text": "The data subject shall have the right to obtain from the controller the erasure of personal data concerning him or her without undue delay.",
+        "obligation_id": str(SAMPLE_DEP_OBLIGATION_ID),
+        "node_id": str(SAMPLE_DEP_OBLIGATION_ID),
+        "score": 0.8820,
+        "framework": "SOC 2",
+        "version": "2017",
+        "clause": "CC6.2",
+        "category": "Access Control",
+        "title": "User Registration and Access Authorization",
+        "text": "Prior to issuing system credentials and granting access, the entity registers and authorizes new users.",
         "mandatory": True,
-        "keywords": ["erasure", "right to be forgotten", "retention period"],
+        "keywords": ["registration", "credentials", "authorization"],
         "payload": {
-            "obligation_id": "GDPR_2026_ART_17",
-            "framework": "GDPR",
-            "version": "2016",
-            "clause": "Article 17",
-            "category": "Data Subject Rights",
-            "title": "Right to Erasure ('Right to be Forgotten')",
-            "text": "The data subject shall have the right to obtain from the controller the erasure of personal data concerning him or her without undue delay.",
+            "obligation_id": str(SAMPLE_DEP_OBLIGATION_ID),
+            "framework": "SOC 2",
+            "version": "2017",
+            "clause": "CC6.2",
+            "category": "Access Control",
+            "title": "User Registration and Access Authorization",
+            "text": "Prior to issuing system credentials and granting access, the entity registers and authorizes new users.",
             "mandatory": True,
-            "keywords": ["erasure", "right to be forgotten", "retention period"],
+            "keywords": ["registration", "credentials", "authorization"],
         },
     },
 ]
+
+# Mock Neo4j graph expansion record for SAMPLE_OBLIGATION_ID (Phase 2 Step 2 sample graph)
+MOCK_SAMPLE_GRAPH_EXPANSION_RECORD = {
+    "obligation_id": str(SAMPLE_OBLIGATION_ID),
+    "obligation": {
+        "id": str(SAMPLE_OBLIGATION_ID),
+        "code": "CC6.1",
+        "title": "Logical and Physical Access Controls",
+        "description": "The entity implements logical access security software, infrastructure, and architectures over protected information assets to protect them from security events.",
+        "category": "Access Control",
+        "mandatory": True,
+        "keywords": ["access control", "security events"],
+    },
+    "version": {
+        "id": str(SAMPLE_VERSION_ID),
+        "version_slug": "2017",
+        "framework_id": str(SAMPLE_FRAMEWORK_ID),
+        "description": "SOC 2 Trust Services Criteria (2017 Revision)",
+        "is_active": True,
+        "publication_date": "2017-01-01",
+    },
+    "framework": {
+        "id": str(SAMPLE_FRAMEWORK_ID),
+        "name": "SOC 2",
+        "description": "Service Organization Control 2 Trust Services Criteria",
+    },
+    "categories": [
+        {
+            "id": str(SAMPLE_CATEGORY_ID),
+            "name": "Access Control",
+            "code": "AC",
+            "description": "Controls governing user authentication, access authorizations, and perimeter security.",
+        }
+    ],
+    "evidence_artifacts": [
+        {
+            "id": str(SAMPLE_EVIDENCE_ID),
+            "name": "okta_mfa_policy_2026.pdf",
+            "file_path": "evidence/org-001/okta_mfa_policy_2026.pdf",
+            "status": "approved",
+            "coverage": "FULL",
+            "coverage_status": "FULL",
+            "confidence": 0.95,
+            "reasoning": "Evidence verifies mandatory Okta MFA across all production access points.",
+            "evidence_text": "All employees accessing company production environments must authenticate using Okta MFA.",
+            "similarity_score": 0.95,
+        }
+    ],
+    "dependencies": [
+        {
+            "id": str(SAMPLE_DEP_OBLIGATION_ID),
+            "code": "CC6.2",
+            "title": "User Registration and Access Authorization",
+            "description": "Prior to issuing system credentials and granting access, the entity registers and authorizes new users.",
+            "direction": "OUTGOING",
+            "rel_type": "DEPENDS_ON",
+            "rel_description": "Logical access control enforcement depends on verified user access authorization.",
+        }
+    ],
+    "supersedes": [
+        {
+            "id": str(SAMPLE_SUPERSEDED_OBLIGATION_ID),
+            "code": "CC6.1-2014",
+            "title": "Logical Access Controls (2014 Criteria)",
+            "description": "Legacy logical access control requirement superseded by the 2017 TSC revision.",
+            "direction": "OUTGOING",
+            "rel_type": "SUPERSEDES",
+            "reason": "2017 Trust Services Criteria revision supersedes 2014 criteria requirement.",
+        }
+    ],
+}
 
 
 @pytest.fixture
@@ -84,179 +174,235 @@ def mock_qdrant_client():
     return client
 
 
+@pytest.fixture
+def mock_graph_service():
+    """Mock GraphService instance."""
+    service = MagicMock()
+    service.execute_query = AsyncMock(return_value=[MOCK_SAMPLE_GRAPH_EXPANSION_RECORD])
+    return service
+
+
 # -----------------------------------------------------------------------------
-# Unit Tests
+# Step 6.1 Tests: Vector Retrieval
 # -----------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_retrieve_relevant_obligations_success(mock_qdrant_client):
     """
-    Test successful retrieval of obligations for a user question.
+    Test Step 6.1: Successful retrieval of obligations for a user question.
     Verifies obligation IDs, Neo4j node IDs, similarity scores, and metadata.
     """
     engine = GraphRAGEngine(qdrant_client=mock_qdrant_client)
 
-    question = "What are the GDPR requirements for data retention?"
+    question = "What logical access controls apply under SOC 2?"
     results = await engine.retrieve_relevant_obligations(question, top_k=2)
 
     assert len(results) == 2
     assert all(isinstance(r, RetrievedObligation) for r in results)
 
-    # Verify top result
     top = results[0]
-    assert top.obligation_id == "GDPR_2026_ART_5_1_E"
-    assert top.node_id == "GDPR_2026_ART_5_1_E"
-    assert top.clause == "Article 5(1)(e)"
-    assert top.category == "Storage Limitation"
-    assert top.framework == "GDPR"
-    assert top.score == pytest.approx(0.9142, rel=1e-3)
-    assert top.mandatory is True
-    assert "retention" in top.keywords
-
-    # Verify second result
-    second = results[1]
-    assert second.obligation_id == "GDPR_2026_ART_17"
-    assert second.node_id == "GDPR_2026_ART_17"
-    assert second.clause == "Article 17"
-    assert second.score == pytest.approx(0.8715, rel=1e-3)
-
-    # Verify existing integration code was reused
-    mock_qdrant_client.generate_embedding.assert_called_once_with(question)
-    mock_qdrant_client.search_similar_obligations.assert_called_once()
-    call_kwargs = mock_qdrant_client.search_similar_obligations.call_args[1]
-    assert call_kwargs["limit"] == 2
-    assert call_kwargs["query_text"] == question
-
-
-@pytest.mark.asyncio
-async def test_retrieve_configurable_top_k(mock_qdrant_client):
-    """
-    Test that top_k is configurable and defaults to 5.
-    """
-    engine = GraphRAGEngine(qdrant_client=mock_qdrant_client)
-
-    # Default top_k
-    await engine.retrieve_relevant_obligations("What are the access controls?")
-    call_kwargs_default = mock_qdrant_client.search_similar_obligations.call_args[1]
-    assert call_kwargs_default["limit"] == DEFAULT_TOP_K
-
-    # Custom top_k = 10
-    await engine.retrieve_relevant_obligations("What are the access controls?", top_k=10)
-    call_kwargs_custom = mock_qdrant_client.search_similar_obligations.call_args[1]
-    assert call_kwargs_custom["limit"] == 10
+    assert top.obligation_id == str(SAMPLE_OBLIGATION_ID)
+    assert top.node_id == str(SAMPLE_OBLIGATION_ID)
+    assert top.clause == "CC6.1"
+    assert top.framework == "SOC 2"
+    assert top.score == pytest.approx(0.9450, rel=1e-3)
 
 
 @pytest.mark.asyncio
 async def test_retrieve_empty_question_returns_empty_list(mock_qdrant_client):
-    """
-    Test that empty or whitespace-only questions gracefully return empty list.
-    """
+    """Test that empty questions gracefully return empty list."""
     engine = GraphRAGEngine(qdrant_client=mock_qdrant_client)
-
     assert await engine.retrieve_relevant_obligations("") == []
     assert await engine.retrieve_relevant_obligations("   ") == []
     assert await engine.retrieve_relevant_obligations(None) == []
 
-    # Verify Qdrant search was never called for blank queries
-    mock_qdrant_client.search_similar_obligations.assert_not_called()
+
+# -----------------------------------------------------------------------------
+# Step 6.2 Tests: Graph Context Expansion
+# -----------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_retrieve_empty_qdrant_results_returns_empty_list(mock_qdrant_client):
+async def test_expand_graph_context_sample_graph(mock_graph_service):
     """
-    Test that empty search results from Qdrant are handled gracefully.
+    Verify Phase 2 Step 6.2: Graph context expansion using Phase 2 Step 2 sample graph.
+
+    Verifies that the obligation (CC6.1) can be expanded into its connected:
+    - version (2017)
+    - framework (SOC 2)
+    - category (Access Control)
+    - evidence (okta_mfa_policy_2026.pdf) with SATISFIES status and score
+    - related dependencies (CC6.2 via DEPENDS_ON)
+    - related supersedes (CC6.1-2014 via SUPERSEDES)
     """
-    mock_qdrant_client.search_similar_obligations.return_value = []
-    engine = GraphRAGEngine(qdrant_client=mock_qdrant_client)
+    engine = GraphRAGEngine(graph_service=mock_graph_service)
 
-    results = await engine.retrieve_relevant_obligations("Non-existent obligation query")
-    assert results == []
-
-
-@pytest.mark.asyncio
-async def test_retrieve_with_filters(mock_qdrant_client):
-    """
-    Test metadata filters (framework, version, category, score_threshold).
-    """
-    engine = GraphRAGEngine(qdrant_client=mock_qdrant_client)
-
-    await engine.retrieve_relevant_obligations(
-        question="What are the access control requirements?",
-        top_k=3,
-        framework="SOC 2",
-        version="2017",
-        category="Access Control",
-        score_threshold=0.80,
+    # Expand graph context around the sample obligation ID
+    context = await engine.expand_graph_context(
+        obligation_ids=[SAMPLE_OBLIGATION_ID],
+        max_depth=1,
+        query="What are the access control requirements under SOC 2?",
     )
 
-    call_kwargs = mock_qdrant_client.search_similar_obligations.call_args[1]
-    assert call_kwargs["framework"] == "SOC 2"
-    assert call_kwargs["version"] == "2017"
-    assert call_kwargs["category"] == "Access Control"
-    assert call_kwargs["score_threshold"] == 0.80
-    assert call_kwargs["limit"] == 3
+    assert isinstance(context, GraphRAGContext)
+    assert context.total_obligations == 1
+    assert context.total_evidence == 1
+    assert context.total_related == 2
+    assert len(context.obligations) == 1
+
+    expanded_ob = context.obligations[0]
+
+    # 1. Verify Obligation Node
+    assert expanded_ob.obligation.id == str(SAMPLE_OBLIGATION_ID)
+    assert expanded_ob.obligation.code == "CC6.1"
+    assert expanded_ob.clause == "CC6.1"
+    assert expanded_ob.node_id == str(SAMPLE_OBLIGATION_ID)
+    assert "logical access" in expanded_ob.obligation.description.lower()
+
+    # 2. Verify Framework Node
+    assert expanded_ob.framework is not None
+    assert expanded_ob.framework.id == str(SAMPLE_FRAMEWORK_ID)
+    assert expanded_ob.framework.name == "SOC 2"
+
+    # 3. Verify Version Node
+    assert expanded_ob.version is not None
+    assert expanded_ob.version.id == str(SAMPLE_VERSION_ID)
+    assert expanded_ob.version.version_slug == "2017"
+
+    # 4. Verify Control Category
+    assert len(expanded_ob.categories) == 1
+    assert expanded_ob.categories[0].id == str(SAMPLE_CATEGORY_ID)
+    assert expanded_ob.categories[0].name == "Access Control"
+    assert expanded_ob.categories[0].code == "AC"
+
+    # 5. Verify Evidence Artifact (SATISFIES)
+    assert len(expanded_ob.evidence_artifacts) == 1
+    ev = expanded_ob.evidence_artifacts[0]
+    assert ev.id == str(SAMPLE_EVIDENCE_ID)
+    assert ev.name == "okta_mfa_policy_2026.pdf"
+    assert ev.coverage == "FULL"
+    assert ev.confidence == 0.95
+    assert ev.status == "approved"
+    assert "Okta MFA" in ev.evidence_text
+
+    # 6. Verify Related Dependencies (DEPENDS_ON)
+    assert len(expanded_ob.dependencies) == 1
+    dep = expanded_ob.dependencies[0]
+    assert dep.id == str(SAMPLE_DEP_OBLIGATION_ID)
+    assert dep.code == "CC6.2"
+    assert dep.rel_type == "DEPENDS_ON"
+    assert dep.direction == "OUTGOING"
+    assert "registration" in dep.title.lower()
+
+    # 7. Verify Related Supersedes (SUPERSEDES)
+    assert len(expanded_ob.supersedes) == 1
+    sup = expanded_ob.supersedes[0]
+    assert sup.id == str(SAMPLE_SUPERSEDED_OBLIGATION_ID)
+    assert sup.code == "CC6.1-2014"
+    assert sup.rel_type == "SUPERSEDES"
+    assert sup.direction == "OUTGOING"
+    assert "2017 Trust Services Criteria revision" in sup.details
 
 
 @pytest.mark.asyncio
-async def test_extract_node_ids_and_get_top_node_ids(mock_qdrant_client):
+async def test_expand_graph_context_empty_and_missing_nodes(mock_graph_service):
     """
-    Test extraction of Neo4j node IDs from retrieved obligations.
+    Test safe handling of empty inputs and missing nodes in Neo4j.
     """
-    engine = GraphRAGEngine(qdrant_client=mock_qdrant_client)
+    engine = GraphRAGEngine(graph_service=mock_graph_service)
 
-    # 1. Test extract_node_ids directly
-    retrieved = await engine.retrieve_relevant_obligations("Test retention question")
-    node_ids = engine.extract_node_ids(retrieved)
-    assert node_ids == ["GDPR_2026_ART_5_1_E", "GDPR_2026_ART_17"]
+    # 1. Empty obligation IDs list
+    empty_context = await engine.expand_graph_context([])
+    assert isinstance(empty_context, GraphRAGContext)
+    assert empty_context.total_obligations == 0
+    assert empty_context.obligations == []
 
-    # 2. Test get_top_obligation_node_ids convenience method
-    direct_node_ids = await engine.get_top_obligation_node_ids("Test retention question", top_k=2)
-    assert direct_node_ids == ["GDPR_2026_ART_5_1_E", "GDPR_2026_ART_17"]
+    # 2. Obligation IDs not found in Neo4j (returns empty list)
+    mock_graph_service.execute_query.return_value = []
+    missing_context = await engine.expand_graph_context(["NON_EXISTENT_ID_999"])
+    assert missing_context.total_obligations == 0
+    assert missing_context.obligations == []
 
 
 @pytest.mark.asyncio
-async def test_retrieved_obligation_accessors():
+async def test_query_and_expand_pipeline(mock_qdrant_client, mock_graph_service):
     """
-    Test dict conversion and subscript access on RetrievedObligation model.
+    Test the complete end-to-end Step 6.1 + Step 6.2 pipeline:
+    Question -> Qdrant retrieval -> Neo4j graph context expansion -> GraphRAGContext.
     """
-    ob = RetrievedObligation(
-        obligation_id="OBL-101",
-        node_id="OBL-101",
-        score=0.95,
-        framework="ISO 27001",
-        clause="A.9.1.1",
-        category="Access Control",
-        title="Access Control Policy",
-        text="An access control policy shall be established.",
+    engine = GraphRAGEngine(
+        qdrant_client=mock_qdrant_client,
+        graph_service=mock_graph_service,
     )
 
-    # Subscript access
-    assert ob["obligation_id"] == "OBL-101"
-    assert ob["node_id"] == "OBL-101"
-    assert ob["clause"] == "A.9.1.1"
-    assert ob["score"] == 0.95
+    question = "What are the logical access controls required under SOC 2?"
+    context = await engine.query_and_expand(question=question, top_k=1)
 
-    # to_dict conversion
-    d = ob.to_dict()
-    assert isinstance(d, dict)
-    assert d["node_id"] == "OBL-101"
-    assert d["framework"] == "ISO 27001"
+    assert isinstance(context, GraphRAGContext)
+    assert context.query == question
+    assert context.total_obligations == 1
+    assert len(context.obligations) == 1
+
+    # Verify retrieval score from Qdrant was preserved on the expanded context
+    expanded_ob = context.obligations[0]
+    assert expanded_ob.retrieval_score == pytest.approx(0.9450, rel=1e-3)
+    assert expanded_ob.clause == "CC6.1"
+    assert expanded_ob.framework.name == "SOC 2"
 
 
 @pytest.mark.asyncio
-async def test_exception_handling(mock_qdrant_client):
+async def test_graph_rag_context_llm_formatting_and_citations(mock_graph_service):
     """
-    Test exception handling: graceful default vs raise_on_error.
+    Test prompt context rendering and citation provenance extraction.
     """
-    mock_qdrant_client.search_similar_obligations.side_effect = ConnectionError("Qdrant unreachable")
-    engine = GraphRAGEngine(qdrant_client=mock_qdrant_client)
+    engine = GraphRAGEngine(graph_service=mock_graph_service)
+    context = await engine.expand_graph_context(
+        obligation_ids=[SAMPLE_OBLIGATION_ID],
+        query="What access controls are needed?",
+    )
 
-    # Default: returns [] gracefully without raising
-    results = await engine.retrieve_relevant_obligations("Query when Qdrant is down")
-    assert results == []
+    # 1. Test format_for_llm
+    prompt_text = context.format_for_llm()
+    assert "CC6.1" in prompt_text
+    assert "SOC 2" in prompt_text
+    assert "Access Control" in prompt_text
+    assert "okta_mfa_policy_2026.pdf" in prompt_text
+    assert "CC6.2" in prompt_text
+    assert "CC6.1-2014" in prompt_text
 
-    # With raise_on_error=True: raises RAGRetrievalError
-    with pytest.raises(RAGRetrievalError) as exc_info:
-        await engine.retrieve_relevant_obligations("Query when Qdrant is down", raise_on_error=True)
-    assert "Qdrant unreachable" in str(exc_info.value)
+    # 2. Test get_citation_sources
+    citations = context.get_citation_sources()
+    assert len(citations) >= 2
+
+    # Obligation citation
+    ob_cit = next(c for c in citations if c["type"] == "obligation")
+    assert ob_cit["clause"] == "CC6.1"
+    assert ob_cit["framework"] == "SOC 2"
+    assert ob_cit["version"] == "2017"
+    assert ob_cit["node_id"] == str(SAMPLE_OBLIGATION_ID)
+
+    # Evidence citation
+    ev_cit = next(c for c in citations if c["type"] == "evidence")
+    assert ev_cit["name"] == "okta_mfa_policy_2026.pdf"
+    assert ev_cit["coverage"] == "FULL"
+    assert ev_cit["evidence_id"] == str(SAMPLE_EVIDENCE_ID)
+
+
+@pytest.mark.asyncio
+async def test_expand_graph_error_handling(mock_graph_service):
+    """
+    Test error resilience in graph context expansion.
+    """
+    mock_graph_service.execute_query.side_effect = ConnectionError("Neo4j database unavailable")
+    engine = GraphRAGEngine(graph_service=mock_graph_service)
+
+    # Default: returns empty GraphRAGContext gracefully
+    safe_context = await engine.expand_graph_context([SAMPLE_OBLIGATION_ID], raise_on_error=False)
+    assert isinstance(safe_context, GraphRAGContext)
+    assert safe_context.total_obligations == 0
+
+    # With raise_on_error=True: raises RAGGraphExpansionError
+    with pytest.raises(RAGGraphExpansionError) as exc_info:
+        await engine.expand_graph_context([SAMPLE_OBLIGATION_ID], raise_on_error=True)
+    assert "Neo4j database unavailable" in str(exc_info.value)

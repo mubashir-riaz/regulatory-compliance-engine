@@ -1,39 +1,41 @@
 """
-Graph RAG Engine - Qdrant Retrieval & Graph Context Expansion (Phase 2, Steps 6.1 & 6.2).
+Graph RAG Engine - Retrieval, Graph Context Expansion & Grounded Answer Synthesis (Phase 2, Step 6).
 
-Responsible for:
-1. Step 6.1 — Semantic Vector Retrieval:
-   - Accepts user question.
-   - Generates vector embedding using configured provider (Gemini, FastEmbed, or local fallback).
-   - Searches Qdrant for top-k most relevant regulatory obligations.
-   - Returns obligation IDs, similarity scores, and metadata.
-
-2. Step 6.2 — Graph Context Expansion:
-   - Takes obligation node IDs returned by Qdrant.
-   - Queries Neo4j using those IDs to expand the graph around each obligation.
-   - Traverses and retrieves:
-     * RegulatoryFramework (e.g. SOC 2, GDPR)
-     * RegulatoryVersion (e.g. 2017, 2016)
-     * ControlCategory (CATEGORIZED_AS)
-     * EvidenceArtifacts (SATISFIES, with coverage, confidence, reasoning, evidence_text)
-     * Related obligations: DEPENDS_ON (outgoing & incoming dependencies)
-     * Related obligations: SUPERSEDES (outgoing & incoming superseding relationships)
-   - Limits traversal depth to avoid retrieving an unnecessarily large graph.
-   - Preserves node IDs, clause numbers, relationship types, evidence IDs, and provenance for citations.
-   - Builds a structured GraphRAGContext object ready for downstream LLM synthesis (Step 6.3).
-   - Handles missing nodes and empty graph results safely.
+Implements the complete Graph RAG pipeline:
+Step 6.1 — Qdrant Semantic Retrieval:
+  - Vector search over regulatory obligations.
+  - Returns top-k obligations with similarity scores and metadata.
+Step 6.2 — Neo4j Graph Context Expansion:
+  - Traverses from obligation node IDs to connected RegulatoryVersion, RegulatoryFramework,
+    ControlCategory, EvidenceArtifacts, DEPENDS_ON, and SUPERSEDES relationships.
+  - Limits traversal depth to prevent graph explosion.
+  - Preserves full provenance (node IDs, clauses, evidence IDs).
+Step 6.3 — LLM Answer Generation & Verifiable Citations:
+  - Combines question + Qdrant results + Neo4j graph context.
+  - Prompts configured LLM (Groq or Gemini) with strict grounding instructions.
+  - Validates and returns structured answer, cited node IDs, and evidence IDs.
+  - Provides a deterministic fallback for offline testing or LLM downtime.
 """
 
+import json
 import logging
-from typing import Any, Dict, List, Optional, Sequence, Union
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Union
 from uuid import UUID
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.core.config import settings
 from app.integrations.qdrant_client import (
     QdrantClient,
     qdrant_client as global_qdrant_client,
+)
+from app.schemas.compliance import (
+    CitationItem,
+    ComplianceQueryRequest,
+    ComplianceQueryResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,14 +45,74 @@ DEFAULT_TOP_K = 5
 DEFAULT_TRAVERSAL_DEPTH = 1
 DEFAULT_COLLECTION_NAME = getattr(settings, "QDRANT_COLLECTION", "regulatory_obligations")
 
+# Default prompt path
+DEFAULT_ANSWER_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "rag_answer.txt"
 
-class RAGRetrievalError(Exception):
+# Default LLM models
+DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
+
+# Embedded prompt fallback if template file is not found
+EMBEDDED_ANSWER_PROMPT_TEMPLATE = """
+You are an expert regulatory compliance auditor and legal engineering AI.
+Your task is to provide an accurate, strictly grounded answer to the user's compliance question based ONLY on the provided regulatory knowledge graph context.
+
+### User Question:
+{question}
+
+### Regulatory Compliance Graph Context:
+{graph_context}
+
+### Strict Auditing Instructions:
+1. Grounding: Answer ONLY using the provided regulatory knowledge graph context above. Do NOT assume, extrapolate, or invent requirements that are not explicitly stated in the context.
+2. Insufficient Context: If the retrieved context does not contain enough information to answer the question, clearly state: "The retrieved regulatory context does not contain sufficient information to answer this question." Do not fabricate obligations.
+3. Citations: Every factual regulatory statement must cite the corresponding obligation clause and Neo4j node_id.
+4. Evidence: If relevant satisfying evidence artifacts exist in the context, reference their evidence IDs and document names in your answer.
+5. JSON Output: Return strictly a valid JSON object matching the format below with no markdown fences, reasoning tags, or extra commentary.
+
+### JSON Output Schema:
+{{
+  "answer": "Detailed, professional compliance answer based strictly on the retrieved context...",
+  "citations": [
+    {{
+      "node_id": "exact_node_id_from_context",
+      "clause": "exact_clause_from_context",
+      "framework": "exact_framework_from_context",
+      "title": "exact_title_from_context"
+    }}
+  ],
+  "cited_node_ids": [
+    "exact_node_id_from_context"
+  ],
+  "evidence_ids": [
+    "exact_evidence_id_from_context"
+  ]
+}}
+""".strip()
+
+
+class RAGServiceError(Exception):
+    """Base exception for Graph RAG service errors."""
+    pass
+
+
+class RAGRetrievalError(RAGServiceError):
     """Exception raised when retrieval in the RAG pipeline fails."""
     pass
 
 
-class RAGGraphExpansionError(Exception):
+class RAGGraphExpansionError(RAGServiceError):
     """Exception raised when graph context expansion in Neo4j fails."""
+    pass
+
+
+class RAGLLMError(RAGServiceError):
+    """Raised when LLM provider request fails or authentication fails."""
+    pass
+
+
+class RAGParseError(RAGServiceError):
+    """Raised when LLM response cannot be parsed or validated."""
     pass
 
 
@@ -530,33 +592,61 @@ class GraphRAGEngine:
     """
     Graph RAG Query Engine.
 
-    Phase 2 Step 6.1 & Step 6.2:
+    Phase 2 Steps 6.1, 6.2, and 6.3:
     - Step 6.1: Semantic retrieval of top-k obligations from Qdrant.
-    - Step 6.2: Multi-hop graph context expansion in Neo4j (Version, Framework, Categories, Evidence, Dependencies, Supersedes).
+    - Step 6.2: Multi-hop graph context expansion in Neo4j.
+    - Step 6.3: Grounded answer generation and verifiable citations via LLM.
     """
 
     def __init__(
         self,
         qdrant_client: Optional[QdrantClient] = None,
         graph_service: Optional[Any] = None,
+        provider: Optional[str] = None,
+        groq_api_key: Optional[str] = None,
+        gemini_api_key: Optional[str] = None,
+        prompt_path: Optional[Union[str, Path]] = None,
+        http_client: Optional[httpx.AsyncClient] = None,
+        fallback_enabled: bool = True,
         default_top_k: int = DEFAULT_TOP_K,
         collection_name: Optional[str] = None,
         max_traversal_depth: int = DEFAULT_TRAVERSAL_DEPTH,
     ):
         """
-        Initialize GraphRAGEngine with vector and graph client integrations.
+        Initialize GraphRAGEngine with vector, graph, and LLM services.
 
         :param qdrant_client: Reusable QdrantClient instance (defaults to global singleton)
         :param graph_service: Reusable GraphService instance (defaults to global singleton)
+        :param provider: LLM provider ("groq" or "gemini", defaults to settings.LLM_PROVIDER)
+        :param groq_api_key: Groq API key
+        :param gemini_api_key: Google Gemini API key
+        :param prompt_path: Path to custom prompt template for answer synthesis
+        :param http_client: Reusable httpx.AsyncClient
+        :param fallback_enabled: If True, uses deterministic fallback when LLM is unavailable
         :param default_top_k: Default number of top results to retrieve from Qdrant (default: 5)
         :param collection_name: Optional Qdrant collection name override
         :param max_traversal_depth: Default maximum graph traversal depth (default: 1)
         """
         self.qdrant_client = qdrant_client or global_qdrant_client
         self._graph_service = graph_service
+        self.provider = (provider or getattr(settings, "LLM_PROVIDER", "groq")).lower().strip()
+        self.groq_api_key = (
+            groq_api_key
+            if groq_api_key is not None
+            else getattr(settings, "GROQ_API_KEY", None)
+        )
+        self.gemini_api_key = (
+            gemini_api_key
+            if gemini_api_key is not None
+            else getattr(settings, "GEMINI_API_KEY", None)
+        )
+        self.prompt_path = Path(prompt_path) if prompt_path else DEFAULT_ANSWER_PROMPT_PATH
+        self._http_client = http_client
+        self.fallback_enabled = fallback_enabled
         self.default_top_k = default_top_k
         self.collection_name = collection_name or DEFAULT_COLLECTION_NAME
         self.max_traversal_depth = max_traversal_depth
+        self._prompt_template: Optional[str] = None
 
     @property
     def graph_service(self) -> Any:
@@ -567,6 +657,34 @@ class GraphRAGEngine:
             from app.services.graph_service import graph_service
             self._graph_service = graph_service
         return self._graph_service
+
+    # -------------------------------------------------------------------------
+    # Prompt Template Management
+    # -------------------------------------------------------------------------
+
+    def load_prompt_template(self) -> str:
+        """
+        Load the RAG answer synthesis prompt template from file or fallback to embedded template.
+        """
+        if self._prompt_template is None:
+            if self.prompt_path.exists():
+                self._prompt_template = self.prompt_path.read_text(encoding="utf-8")
+            else:
+                logger.warning(
+                    f"RAG answer prompt template file not found at {self.prompt_path}, using embedded template."
+                )
+                self._prompt_template = EMBEDDED_ANSWER_PROMPT_TEMPLATE
+        return self._prompt_template
+
+    def format_answer_prompt(self, question: str, context: GraphRAGContext) -> str:
+        """
+        Format the LLM answer synthesis prompt with user question and rendered graph context.
+        """
+        template = self.load_prompt_template()
+        formatted_context = context.format_for_llm()
+        prompt = template.replace("{question}", question.strip())
+        prompt = prompt.replace("{graph_context}", formatted_context.strip())
+        return prompt
 
     # -------------------------------------------------------------------------
     # Step 6.1: Vector Retrieval
@@ -706,15 +824,11 @@ class GraphRAGEngine:
         - Related obligations via DEPENDS_ON (both outgoing and incoming)
         - Related obligations via SUPERSEDES (both outgoing and incoming)
 
-        Traversals are bounded by max_depth to prevent graph explosion.
-        All provenance (node IDs, relationship types, evidence IDs) is preserved.
-
         :param obligation_ids: Sequence of obligation node IDs or RetrievedObligation models
         :param max_depth: Traversal depth limit (default: 1)
         :param query: Optional original user question to include in context
         :param scores_map: Optional mapping of obligation ID -> similarity score
-        :param raise_on_error: If True, raises RAGGraphExpansionError on failure;
-                               if False (default), logs and returns empty GraphRAGContext gracefully.
+        :param raise_on_error: If True, raises RAGGraphExpansionError on failure
         :return: Structured GraphRAGContext model
         """
         if not obligation_ids:
@@ -933,12 +1047,7 @@ class GraphRAGEngine:
             logger.error(f"Error during graph context expansion in Neo4j: {err}", exc_info=True)
             if raise_on_error:
                 raise RAGGraphExpansionError(f"Neo4j graph expansion failed: {err}") from err
-            # Handle missing/error states safely by returning empty context
             return GraphRAGContext(query=query)
-
-    # -------------------------------------------------------------------------
-    # Combined Pipeline: Retrieval + Graph Expansion
-    # -------------------------------------------------------------------------
 
     async def query_and_expand(
         self,
@@ -953,24 +1062,8 @@ class GraphRAGEngine:
         raise_on_error: bool = False,
     ) -> GraphRAGContext:
         """
-        Execute the end-to-end Graph RAG Context Pipeline (Steps 6.1 + 6.2):
-        1. Accepts user question and retrieves top-k relevant obligations from Qdrant (Step 6.1).
-        2. Takes the obligation node IDs and expands graph context in Neo4j (Step 6.2).
-        3. Returns structured GraphRAGContext containing obligations, versions, categories,
-           evidence artifacts, and dependencies.
-
-        :param question: User question (e.g. 'What data retention requirements apply under GDPR?')
-        :param top_k: Maximum number of obligations to retrieve from Qdrant
-        :param framework: Optional framework filter (e.g. 'GDPR')
-        :param version: Optional version filter
-        :param category: Optional category filter
-        :param score_threshold: Optional similarity score threshold
-        :param collection_name: Optional Qdrant collection name
-        :param max_depth: Graph traversal depth limit
-        :param raise_on_error: Whether to raise on retrieval/expansion failures
-        :return: Structured GraphRAGContext model
+        Execute Steps 6.1 + 6.2 (Qdrant Vector Retrieval + Neo4j Graph Context Expansion).
         """
-        # Step 6.1: Qdrant Vector Retrieval
         retrieved = await self.retrieve_relevant_obligations(
             question=question,
             top_k=top_k,
@@ -986,13 +1079,552 @@ class GraphRAGEngine:
             logger.info("No relevant obligations retrieved from Qdrant; returning empty GraphRAGContext.")
             return GraphRAGContext(query=question)
 
-        # Step 6.2: Neo4j Graph Context Expansion
         return await self.expand_graph_context(
             obligation_ids=retrieved,
             max_depth=max_depth,
             query=question,
             raise_on_error=raise_on_error,
         )
+
+    # -------------------------------------------------------------------------
+    # Step 6.3: Grounded LLM Answer Synthesis & Citation Verification
+    # -------------------------------------------------------------------------
+
+    async def generate_grounded_answer(
+        self,
+        question: str,
+        context: GraphRAGContext,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        use_fallback: bool = True,
+    ) -> ComplianceQueryResponse:
+        """
+        Synthesize a grounded compliance answer from the expanded graph context using an LLM.
+
+        Strict Auditing Rules:
+        - Only answers using the retrieved regulatory context.
+        - Cross-verifies citations against actual graph nodes.
+        - Preserves evidence artifact IDs where evidence exists.
+        - Clearly states when context is insufficient.
+
+        :param question: User question
+        :param context: Structured GraphRAGContext containing expanded obligations and evidence
+        :param provider: LLM provider override ('groq' or 'gemini')
+        :param model: LLM model override
+        :param use_fallback: Whether to use deterministic fallback on LLM failure / missing API key
+        :return: Validated ComplianceQueryResponse
+        """
+        # 1. Handle completely empty graph context safely
+        if not context.obligations:
+            logger.info(f"No regulatory obligations in context for question '{question[:80]}'. Returning insufficient context.")
+            return ComplianceQueryResponse(
+                answer=(
+                    f"The retrieved regulatory context does not contain sufficient information to answer this question: "
+                    f"'{question}'. No matching regulatory obligations or controls were found in the knowledge graph."
+                ),
+                citations=[],
+                cited_node_ids=[],
+                evidence_ids=[],
+                metadata={
+                    "status": "insufficient_context",
+                    "obligations_retrieved": 0,
+                    "evidence_count": 0,
+                },
+            )
+
+        target_provider = (provider or self.provider).lower().strip()
+
+        # 2. Check API key configuration
+        has_key = False
+        if target_provider == "groq" and self.groq_api_key and not self.groq_api_key.startswith("your-"):
+            has_key = True
+        elif target_provider in ("gemini", "google") and self.gemini_api_key and not self.gemini_api_key.startswith("your-"):
+            has_key = True
+
+        # Fallback if no LLM key is available
+        if not has_key:
+            if use_fallback and self.fallback_enabled:
+                logger.info(
+                    f"No API key configured for provider '{target_provider}'. "
+                    "Synthesizing grounded compliance answer via deterministic context engine."
+                )
+                return self._generate_fallback_answer(question=question, context=context)
+            raise RAGLLMError(f"API key not configured for LLM provider '{target_provider}'.")
+
+        # 3. Format prompt for LLM
+        prompt = self.format_answer_prompt(question=question, context=context)
+
+        try:
+            logger.info(f"Dispatching Graph RAG answer synthesis to LLM provider '{target_provider}'...")
+            raw_response = await self._call_llm(
+                prompt=prompt,
+                provider=target_provider,
+                model=model,
+            )
+            response = self.parse_and_validate_answer_response(
+                response_text=raw_response,
+                context=context,
+            )
+            logger.info(
+                f"Generated grounded answer ({len(response.answer)} chars) with "
+                f"{len(response.citations)} citation(s) and {len(response.evidence_ids)} evidence ID(s)."
+            )
+            return response
+
+        except Exception as err:
+            logger.warning(f"LLM answer synthesis failed ({err}).", exc_info=True)
+            if use_fallback and self.fallback_enabled:
+                logger.info("Falling back to deterministic answer synthesis.")
+                return self._generate_fallback_answer(question=question, context=context)
+            if isinstance(err, RAGServiceError):
+                raise
+            raise RAGServiceError(f"Answer synthesis failed: {err}") from err
+
+    async def answer_question(
+        self,
+        question: str,
+        top_k: Optional[int] = None,
+        framework: Optional[str] = None,
+        version: Optional[str] = None,
+        category: Optional[str] = None,
+        score_threshold: Optional[float] = None,
+        collection_name: Optional[str] = None,
+        max_depth: Optional[int] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        raise_on_error: bool = False,
+    ) -> ComplianceQueryResponse:
+        """
+        Complete End-to-End Graph RAG Orchestration Flow:
+        1. Accept user question.
+        2. Retrieve top-k relevant obligations from Qdrant (Step 6.1).
+        3. Expand graph context around retrieved obligation node IDs in Neo4j (Step 6.2).
+        4. Synthesize grounded compliance answer with verifiable citations via LLM (Step 6.3).
+
+        :param question: User question (e.g. 'What data retention requirements apply under GDPR?')
+        :param top_k: Maximum number of obligations to retrieve
+        :param framework: Optional framework filter
+        :param version: Optional version filter
+        :param category: Optional category filter
+        :param score_threshold: Optional similarity threshold
+        :param collection_name: Optional collection override
+        :param max_depth: Graph traversal depth
+        :param provider: LLM provider override
+        :param model: LLM model override
+        :param raise_on_error: Whether to raise exceptions
+        :return: Structured ComplianceQueryResponse
+        """
+        clean_question = question.strip() if question else ""
+        if not clean_question:
+            return ComplianceQueryResponse(
+                answer="No question was provided. Please submit a valid compliance question.",
+                citations=[],
+                cited_node_ids=[],
+                evidence_ids=[],
+                metadata={"status": "empty_question"},
+            )
+
+        # 1 & 2. Qdrant Retrieval + Neo4j Graph Context Expansion
+        context = await self.query_and_expand(
+            question=clean_question,
+            top_k=top_k,
+            framework=framework,
+            version=version,
+            category=category,
+            score_threshold=score_threshold,
+            collection_name=collection_name,
+            max_depth=max_depth,
+            raise_on_error=raise_on_error,
+        )
+
+        # 3. LLM Grounded Answer Synthesis
+        return await self.generate_grounded_answer(
+            question=clean_question,
+            context=context,
+            provider=provider,
+            model=model,
+            use_fallback=self.fallback_enabled,
+        )
+
+    # Convenience alias for full query execution
+    query = answer_question
+
+    # -------------------------------------------------------------------------
+    # Response Parsing & Citation Verification
+    # -------------------------------------------------------------------------
+
+    def parse_and_validate_answer_response(
+        self,
+        response_text: str,
+        context: GraphRAGContext,
+    ) -> ComplianceQueryResponse:
+        """
+        Parse raw LLM response text into a validated ComplianceQueryResponse model,
+        and cross-verify citations against actual graph nodes.
+        """
+        if not response_text or not response_text.strip():
+            raise RAGParseError("Received empty response text from LLM.")
+
+        cleaned = self._clean_json_text(response_text)
+
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            data = self._extract_first_json_object(cleaned)
+            if data is None:
+                raise RAGParseError(f"No valid JSON object found in LLM response: {response_text[:300]}")
+
+        if not isinstance(data, dict):
+            raise RAGParseError(f"Expected JSON object, got {type(data).__name__}")
+
+        raw_answer = str(data.get("answer") or "").strip()
+        if not raw_answer:
+            raise RAGParseError("LLM response did not contain an 'answer' field.")
+
+        # Build index of valid graph nodes and evidence for verification
+        valid_nodes: Dict[str, ExpandedObligationContext] = {
+            ctx.node_id: ctx for ctx in context.obligations
+        }
+        valid_evidence_ids: Set[str] = {
+            ev.id for ctx in context.obligations for ev in ctx.evidence_artifacts
+        }
+
+        # 1. Parse and verify citations against actual graph nodes
+        raw_citations = data.get("citations") or []
+        verified_citations: List[CitationItem] = []
+        cited_node_ids: List[str] = []
+
+        for cit in raw_citations:
+            if isinstance(cit, dict):
+                nid = str(cit.get("node_id") or cit.get("id") or "")
+                if nid in valid_nodes:
+                    matched_ctx = valid_nodes[nid]
+                    verified_citations.append(
+                        CitationItem(
+                            node_id=nid,
+                            clause=cit.get("clause") or matched_ctx.clause,
+                            framework=cit.get("framework") or (matched_ctx.framework.name if matched_ctx.framework else None),
+                            title=cit.get("title") or matched_ctx.obligation.title,
+                        )
+                    )
+                    if nid not in cited_node_ids:
+                        cited_node_ids.append(nid)
+
+        # If LLM didn't produce structured citations or cited an alias, cross-reference clauses in answer text
+        if not verified_citations and context.obligations:
+            for ctx in context.obligations:
+                clause = ctx.clause
+                if clause and (clause.lower() in raw_answer.lower() or ctx.node_id in raw_answer):
+                    verified_citations.append(
+                        CitationItem(
+                            node_id=ctx.node_id,
+                            clause=clause,
+                            framework=ctx.framework.name if ctx.framework else None,
+                            title=ctx.obligation.title,
+                        )
+                    )
+                    if ctx.node_id not in cited_node_ids:
+                        cited_node_ids.append(ctx.node_id)
+
+        # Fallback citations: If still empty, link top retrieved obligation from context
+        if not verified_citations and context.obligations:
+            top_ctx = context.obligations[0]
+            verified_citations.append(
+                CitationItem(
+                    node_id=top_ctx.node_id,
+                    clause=top_ctx.clause,
+                    framework=top_ctx.framework.name if top_ctx.framework else None,
+                    title=top_ctx.obligation.title,
+                )
+            )
+            cited_node_ids.append(top_ctx.node_id)
+
+        # 2. Parse and verify evidence IDs against actual graph evidence
+        raw_ev_ids = data.get("evidence_ids") or []
+        verified_evidence_ids: List[str] = []
+        for eid in raw_ev_ids:
+            eid_str = str(eid).strip()
+            if eid_str in valid_evidence_ids and eid_str not in verified_evidence_ids:
+                verified_evidence_ids.append(eid_str)
+
+        # If LLM referenced evidence filenames in text, match their IDs
+        if not verified_evidence_ids:
+            for ctx in context.obligations:
+                for ev in ctx.evidence_artifacts:
+                    if ev.name.lower() in raw_answer.lower() and ev.id not in verified_evidence_ids:
+                        verified_evidence_ids.append(ev.id)
+
+        metadata = {
+            "obligations_retrieved": context.total_obligations,
+            "evidence_count": context.total_evidence,
+            "provider": self.provider,
+        }
+
+        return ComplianceQueryResponse(
+            answer=raw_answer,
+            citations=verified_citations,
+            cited_node_ids=cited_node_ids,
+            evidence_ids=verified_evidence_ids,
+            metadata=metadata,
+        )
+
+    # -------------------------------------------------------------------------
+    # Deterministic Fallback Answer Synthesizer
+    # -------------------------------------------------------------------------
+
+    def _generate_fallback_answer(
+        self,
+        question: str,
+        context: GraphRAGContext,
+    ) -> ComplianceQueryResponse:
+        """
+        Generate a strictly grounded compliance answer directly from the retrieved
+        graph context without requiring external LLM API calls.
+        Guarantees verifiable citations and prevents arbitrary hallucination.
+        """
+        if not context.obligations:
+            return ComplianceQueryResponse(
+                answer=(
+                    f"The retrieved regulatory context does not contain sufficient information to answer this question: "
+                    f"'{question}'. No matching regulatory obligations or controls were found in the knowledge graph."
+                ),
+                citations=[],
+                cited_node_ids=[],
+                evidence_ids=[],
+                metadata={"status": "insufficient_context"},
+            )
+
+        paragraphs: List[str] = []
+        citations: List[CitationItem] = []
+        cited_node_ids: List[str] = []
+        evidence_ids: List[str] = []
+
+        for ctx in context.obligations:
+            ob = ctx.obligation
+            fw_name = ctx.framework.name if ctx.framework else "Compliance Framework"
+            ver_slug = f" ({ctx.version.version_slug})" if ctx.version else ""
+            clause = ob.clause or ob.code or "Requirement"
+            desc = ob.description or ob.title or "Obligation requirement statement"
+
+            p = f"Under {fw_name}{ver_slug}, {clause} ({ob.title or 'Control'}) requires that: {desc}"
+
+            # Evidence details
+            if ctx.evidence_artifacts:
+                ev_summaries = []
+                for ev in ctx.evidence_artifacts:
+                    cov = ev.coverage or ev.coverage_status or "DOCUMENTED"
+                    ev_summaries.append(f"'{ev.name}' ({cov} coverage, ID: {ev.id})")
+                    if ev.id not in evidence_ids:
+                        evidence_ids.append(ev.id)
+                p += f" This requirement is addressed by satisfying evidence: {', '.join(ev_summaries)}."
+
+            # Dependencies
+            if ctx.dependencies:
+                dep_clauses = [d.code or d.id for d in ctx.dependencies]
+                p += f" Note that compliance with this control depends on: {', '.join(dep_clauses)}."
+
+            # Supersedes
+            if ctx.supersedes:
+                sup_clauses = [s.code or s.id for s in ctx.supersedes]
+                p += f" This control supersedes legacy requirements: {', '.join(sup_clauses)}."
+
+            paragraphs.append(p)
+
+            citations.append(
+                CitationItem(
+                    node_id=ctx.node_id,
+                    clause=clause,
+                    framework=ctx.framework.name if ctx.framework else None,
+                    title=ob.title,
+                )
+            )
+            cited_node_ids.append(ctx.node_id)
+
+        answer_text = "\n\n".join(paragraphs)
+
+        return ComplianceQueryResponse(
+            answer=answer_text,
+            citations=citations,
+            cited_node_ids=cited_node_ids,
+            evidence_ids=evidence_ids,
+            metadata={
+                "mode": "deterministic_synthesis",
+                "obligations_retrieved": context.total_obligations,
+                "evidence_count": len(evidence_ids),
+            },
+        )
+
+    # -------------------------------------------------------------------------
+    # LLM Provider Dispatch
+    # -------------------------------------------------------------------------
+
+    async def _call_llm(
+        self,
+        prompt: str,
+        provider: str,
+        model: Optional[str] = None,
+    ) -> str:
+        """
+        Dispatch prompt to the configured LLM provider.
+        """
+        if provider == "groq":
+            return await self._call_groq(prompt=prompt, model=model)
+        elif provider in ("gemini", "google"):
+            return await self._call_gemini(prompt=prompt, model=model)
+        else:
+            raise RAGLLMError(f"Unsupported LLM provider '{provider}'. Must be 'groq' or 'gemini'.")
+
+    async def _call_groq(self, prompt: str, model: Optional[str] = None) -> str:
+        """
+        Call Groq API with candidate model fallback.
+        """
+        api_key = self.groq_api_key
+        if not api_key or not api_key.strip() or api_key.startswith("your-"):
+            raise RAGLLMError("GROQ_API_KEY is not configured.")
+
+        candidate_models = (
+            [model] if model else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen/qwen3.6-27b", "openai/gpt-oss-20b"]
+        )
+
+        last_err: Optional[Exception] = None
+        for target_model in candidate_models:
+            try:
+                try:
+                    from groq import AsyncGroq
+                    client = AsyncGroq(api_key=api_key)
+                    completion = await client.chat.completions.create(
+                        model=target_model,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "You are a regulatory compliance auditor. You output strictly valid JSON objects.",
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=0.1,
+                        max_tokens=2048,
+                    )
+                    content = completion.choices[0].message.content
+                    if not content:
+                        raise RAGParseError("Groq returned an empty response.")
+                    return content
+                except ImportError:
+                    headers = {
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    }
+                    payload = {
+                        "model": target_model,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "You are a regulatory compliance auditor. You output strictly valid JSON objects.",
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": 0.1,
+                        "max_tokens": 2048,
+                    }
+
+                    async with (self._http_client or httpx.AsyncClient(timeout=60.0)) as client:
+                        response = await client.post(
+                            "https://api.groq.com/openai/v1/chat/completions",
+                            headers=headers,
+                            json=payload,
+                        )
+                        if response.status_code != 200:
+                            raise RAGLLMError(
+                                f"Groq API returned HTTP {response.status_code}: {response.text}"
+                            )
+                        data = response.json()
+                        content = data["choices"][0]["message"]["content"]
+                        if not content:
+                            raise RAGParseError("Groq returned an empty response.")
+                        return content
+            except Exception as e:
+                err_msg = str(e).lower()
+                last_err = e
+                if "model_not_found" in err_msg or "decommissioned" in err_msg or "does not exist" in err_msg or "404" in err_msg or "400" in err_msg:
+                    logger.debug(f"Groq model '{target_model}' unavailable ({e}), trying next candidate...")
+                    continue
+                if isinstance(e, (RAGLLMError, RAGParseError)):
+                    raise
+                raise RAGLLMError(f"Groq API call failed: {e}") from e
+
+        if isinstance(last_err, (RAGLLMError, RAGParseError)):
+            raise last_err
+        raise RAGLLMError(f"All Groq candidate models failed: {last_err}") from last_err
+
+    async def _call_gemini(self, prompt: str, model: Optional[str] = None) -> str:
+        """
+        Call Google Gemini API via REST endpoint.
+        """
+        api_key = self.gemini_api_key
+        if not api_key or not api_key.strip() or api_key.startswith("your-"):
+            raise RAGLLMError("GEMINI_API_KEY is not configured.")
+
+        target_model = model or DEFAULT_GEMINI_MODEL
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [{"text": prompt}]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
+            },
+        }
+
+        try:
+            async with (self._http_client or httpx.AsyncClient(timeout=60.0)) as client:
+                response = await client.post(url, json=payload)
+                if response.status_code != 200:
+                    raise RAGLLMError(
+                        f"Gemini API returned HTTP {response.status_code}: {response.text}"
+                    )
+                data = response.json()
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    raise RAGParseError(f"Gemini returned no candidates: {data}")
+                content = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                if not content:
+                    raise RAGParseError("Gemini returned empty text content.")
+                return content
+        except Exception as e:
+            if isinstance(e, (RAGLLMError, RAGParseError)):
+                raise
+            raise RAGLLMError(f"Gemini API call failed: {e}") from e
+
+    @staticmethod
+    def _clean_json_text(text: str) -> str:
+        """Strip reasoning <think>...</think> tags and markdown code block wrappers."""
+        text = text.strip()
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        return text
+
+    @classmethod
+    def _extract_first_json_object(cls, text: str) -> Optional[Dict[str, Any]]:
+        """Extract first complete JSON object using JSONDecoder.raw_decode."""
+        idx = text.find("{")
+        while idx != -1:
+            try:
+                obj, _ = json.JSONDecoder().raw_decode(text[idx:])
+                if isinstance(obj, dict):
+                    return obj
+            except json.JSONDecodeError:
+                pass
+            idx = text.find("{", idx + 1)
+        return None
 
     # -------------------------------------------------------------------------
     # Helper & Node Extraction Methods

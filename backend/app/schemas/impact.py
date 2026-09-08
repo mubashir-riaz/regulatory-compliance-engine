@@ -400,3 +400,450 @@ class CompareObligationsRequest(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+
+# =============================================================================
+# Phase 2 Step 7.3: Graph-Based Impact Traversal Schemas
+# =============================================================================
+
+
+class ImpactProvenance(BaseModel):
+    """
+    Provenance trail linking an impacted evidence artifact or control
+    back to an actual graph node and the original changed obligation (Step 7.3).
+    """
+    root_obligation_id: str = Field(
+        ...,
+        description="ID of the changed baseline obligation triggering this traversal",
+    )
+    root_clause: Optional[str] = Field(
+        default=None,
+        description="Clause or article identifier of the root changed obligation",
+    )
+    target_node_id: str = Field(
+        ...,
+        description="ID of the reached target node (e.g. EvidenceArtifact or ControlCategory)",
+    )
+    target_node_label: str = Field(
+        default="EvidenceArtifact",
+        description="Neo4j label of the target node",
+    )
+    traversal_depth: int = Field(
+        default=1,
+        ge=1,
+        description="Graph distance / hop count from the changed obligation to the target node",
+    )
+    path_nodes: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Ordered list of graph nodes encountered along the traversal path",
+    )
+    path_relationships: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Ordered list of relationship edges traversed",
+    )
+    readable_path: str = Field(
+        default="",
+        description="Human-readable provenance path representation (e.g. 'CC6.1 -> SATISFIES -> okta.pdf')",
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AffectedEvidenceItem(BaseModel):
+    """
+    Represents an evidence artifact connected to an impacted obligation via SATISFIES,
+    either directly (depth 1) or transitively through DEPENDS_ON / SUPERSEDES (depth 2+).
+    """
+    evidence_id: str = Field(
+        ...,
+        description="Unique identifier of the EvidenceArtifact graph node",
+    )
+    evidence_name: str = Field(
+        ...,
+        description="Title or file name of the evidence artifact",
+    )
+    evidence_title: Optional[str] = Field(
+        default=None,
+        description="Display title or formal document title",
+    )
+    file_path: Optional[str] = Field(
+        default=None,
+        description="Storage or repository path for the evidence artifact",
+    )
+    evidence_status: Optional[str] = Field(
+        default=None,
+        description="Status property on the EvidenceArtifact node (e.g. 'COMPLETED', 'PENDING')",
+    )
+    obligation_id: str = Field(
+        ...,
+        description="ID of the obligation directly connected to this evidence artifact",
+    )
+    clause: Optional[str] = Field(
+        default=None,
+        description="Clause or code of the connected obligation (e.g. 'Article 5(1)(e)', 'CC6.1')",
+    )
+    obligation_title: Optional[str] = Field(
+        default=None,
+        description="Title of the connected obligation",
+    )
+    root_obligation_id: Optional[str] = Field(
+        default=None,
+        description="ID of the root modified/removed obligation that initiated graph traversal",
+    )
+    root_clause: Optional[str] = Field(
+        default=None,
+        description="Clause of the root modified/removed obligation",
+    )
+    change_type: Optional[str] = Field(
+        default=None,
+        description="Classification of the change: MODIFIED or REMOVED",
+    )
+    impact_type: str = Field(
+        default="DIRECT",
+        description="Impact category: 'DIRECT' (SATISFIES) or 'INDIRECT' (via DEPENDS_ON/SUPERSEDES)",
+    )
+    depth: int = Field(
+        default=1,
+        ge=1,
+        description="Traversal depth from changed obligation to evidence artifact",
+    )
+    coverage_status: Optional[str] = Field(
+        default=None,
+        description="Existing coverage status on SATISFIES edge (e.g. 'FULL', 'PARTIAL', 'NONE', 'approved')",
+    )
+    confidence: Optional[float] = Field(
+        default=None,
+        description="Confidence score stored on the SATISFIES relationship",
+    )
+    reasoning: Optional[str] = Field(
+        default=None,
+        description="Auditor reasoning stored on the SATISFIES relationship",
+    )
+    evidence_text: Optional[str] = Field(
+        default=None,
+        description="Relevant evidence text or snippet stored on the SATISFIES relationship",
+    )
+    similarity_score: Optional[float] = Field(
+        default=None,
+        description="Similarity score stored on the SATISFIES relationship",
+    )
+    relationship_type: str = Field(
+        default="SATISFIES",
+        description="Relationship edge type connecting evidence artifact",
+    )
+    relationship_direction: str = Field(
+        default="INCOMING",
+        description="Edge direction relative to obligation ('INCOMING' for (Evidence)-[:SATISFIES]->(Obligation))",
+    )
+    relationship_metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Full preserved properties dictionary from the SATISFIES relationship edge",
+    )
+    provenance: Optional[ImpactProvenance] = Field(
+        default=None,
+        description="Graph provenance trace linking this finding back to the root changed obligation",
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional context metadata",
+    )
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    @field_validator("evidence_id", "obligation_id", mode="before")
+    @classmethod
+    def stringify_ids(cls, v: Any) -> str:
+        return str(v) if v is not None else ""
+
+
+class AffectedControlItem(BaseModel):
+    """
+    Represents a control category connected to an impacted obligation via CATEGORIZED_AS (Step 7.3).
+    """
+    control_id: str = Field(
+        ...,
+        description="ID of the ControlCategory graph node",
+    )
+    control_name: str = Field(
+        ...,
+        description="Name of the control category (e.g. 'Access Control', 'Data Retention')",
+    )
+    control_code: Optional[str] = Field(
+        default=None,
+        description="Short code of the control category (e.g. 'AC')",
+    )
+    control_description: Optional[str] = Field(
+        default=None,
+        description="Description of the control category",
+    )
+    obligation_id: str = Field(
+        ...,
+        description="ID of the connected obligation",
+    )
+    clause: Optional[str] = Field(
+        default=None,
+        description="Clause or code of the connected obligation",
+    )
+    relationship_type: str = Field(
+        default="CATEGORIZED_AS",
+        description="Relationship type",
+    )
+    relationship_metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Properties from the CATEGORIZED_AS relationship edge",
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DependentObligationItem(BaseModel):
+    """
+    Represents an obligation connected via DEPENDS_ON relationship (Step 7.3).
+    """
+    obligation_id: str = Field(..., description="ID of the dependent or dependency obligation")
+    code: Optional[str] = Field(default=None, description="Obligation code (e.g. 'CC6.2')")
+    clause: Optional[str] = Field(default=None, description="Obligation clause")
+    title: Optional[str] = Field(default=None, description="Obligation title")
+    description: Optional[str] = Field(default=None, description="Obligation description or text")
+    direction: str = Field(
+        default="OUTGOING",
+        description="Edge direction: 'OUTGOING' ((o)-[:DEPENDS_ON]->(dep)) or 'INCOMING' ((dep)-[:DEPENDS_ON]->(o))",
+    )
+    dependency_description: Optional[str] = Field(
+        default=None,
+        description="Description property on the DEPENDS_ON relationship edge",
+    )
+    relationship_metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Properties from the DEPENDS_ON edge",
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SupersededObligationItem(BaseModel):
+    """
+    Represents an obligation connected via SUPERSEDES relationship (Step 7.3).
+    """
+    obligation_id: str = Field(..., description="ID of the superseded or superseding obligation")
+    code: Optional[str] = Field(default=None, description="Obligation code (e.g. 'CC6.1-2014')")
+    clause: Optional[str] = Field(default=None, description="Obligation clause")
+    title: Optional[str] = Field(default=None, description="Obligation title")
+    description: Optional[str] = Field(default=None, description="Obligation description or text")
+    direction: str = Field(
+        default="OUTGOING",
+        description="Edge direction: 'OUTGOING' ((o)-[:SUPERSEDES]->(sup)) or 'INCOMING' ((sup)-[:SUPERSEDES]->(o))",
+    )
+    supersedes_reason: Optional[str] = Field(
+        default=None,
+        description="Reason property on the SUPERSEDES relationship edge",
+    )
+    relationship_metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Properties from the SUPERSEDES edge",
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ImpactedObligationTraversal(BaseModel):
+    """
+    Comprehensive graph impact traversal result for a single MODIFIED or REMOVED obligation (Step 7.3).
+    """
+    obligation_id: str = Field(
+        ...,
+        description="ID of the analyzed obligation in the regulatory graph",
+    )
+    clause: Optional[str] = Field(
+        default=None,
+        description="Clause or article identifier of the obligation",
+    )
+    title: Optional[str] = Field(
+        default=None,
+        description="Title of the obligation",
+    )
+    change_type: Optional[str] = Field(
+        default=None,
+        description="Classification of change (MODIFIED or REMOVED)",
+    )
+    reason: Optional[str] = Field(
+        default=None,
+        description="Auditor reasoning explaining why this obligation changed",
+    )
+    direct_evidence: List[AffectedEvidenceItem] = Field(
+        default_factory=list,
+        description="Evidence artifacts directly connected through SATISFIES (depth 1)",
+    )
+    indirect_evidence: List[AffectedEvidenceItem] = Field(
+        default_factory=list,
+        description="Evidence artifacts transitively reached via DEPENDS_ON or SUPERSEDES (depth 2+)",
+    )
+    dependent_obligations: List[DependentObligationItem] = Field(
+        default_factory=list,
+        description="Obligations linked via DEPENDS_ON relationship edges",
+    )
+    superseded_obligations: List[SupersededObligationItem] = Field(
+        default_factory=list,
+        description="Obligations linked via SUPERSEDES relationship edges",
+    )
+    affected_controls: List[AffectedControlItem] = Field(
+        default_factory=list,
+        description="Control categories connected via CATEGORIZED_AS edges",
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Execution and traversal metadata",
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @property
+    def all_evidence(self) -> List[AffectedEvidenceItem]:
+        """All affected evidence items (direct and indirect)."""
+        return self.direct_evidence + self.indirect_evidence
+
+    @property
+    def affected_evidence_ids(self) -> List[str]:
+        """Deduplicated list of affected evidence artifact IDs."""
+        seen = set()
+        ids = []
+        for ev in self.all_evidence:
+            if ev.evidence_id not in seen:
+                seen.add(ev.evidence_id)
+                ids.append(ev.evidence_id)
+        return ids
+
+
+class GraphImpactTraversalResult(BaseModel):
+    """
+    Aggregated result of graph-based impact traversal across all MODIFIED and REMOVED obligations (Step 7.3).
+    """
+    framework: Optional[str] = Field(
+        default=None,
+        description="Regulatory framework identifier (e.g. 'GDPR', 'SOC 2')",
+    )
+    baseline_version: Optional[str] = Field(
+        default=None,
+        description="Baseline version identifier (e.g. '2016', '2017')",
+    )
+    draft_version: Optional[str] = Field(
+        default=None,
+        description="Draft or target version identifier (e.g. '2024-draft')",
+    )
+    traversals: List[ImpactedObligationTraversal] = Field(
+        default_factory=list,
+        description="Per-obligation traversal results for each MODIFIED or REMOVED obligation",
+    )
+    affected_evidence_items: List[AffectedEvidenceItem] = Field(
+        default_factory=list,
+        description="Deduplicated list of all affected evidence items across all analyzed obligations",
+    )
+    affected_evidence_ids: List[str] = Field(
+        default_factory=list,
+        description="Deduplicated list of all affected evidence artifact IDs",
+    )
+    affected_control_ids: List[str] = Field(
+        default_factory=list,
+        description="Deduplicated list of all affected control category IDs",
+    )
+    total_impacted_obligations: int = Field(
+        default=0,
+        description="Total number of MODIFIED or REMOVED obligations traversed",
+    )
+    total_affected_evidence: int = Field(
+        default=0,
+        description="Total number of unique affected evidence artifacts found",
+    )
+    total_affected_controls: int = Field(
+        default=0,
+        description="Total number of unique affected control categories found",
+    )
+    max_depth: int = Field(
+        default=2,
+        description="Traversal depth limit used during graph traversal",
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Summary metadata including execution timing, depth limits, and node counts",
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+    def __iter__(self) -> Iterator[ImpactedObligationTraversal]:
+        return iter(self.traversals)
+
+    def __len__(self) -> int:
+        return len(self.traversals)
+
+    def __getitem__(self, index: int) -> ImpactedObligationTraversal:
+        return self.traversals[index]
+
+    @property
+    def direct_evidence(self) -> List[AffectedEvidenceItem]:
+        """All directly affected evidence items (depth 1)."""
+        return [e for e in self.affected_evidence_items if e.impact_type == "DIRECT"]
+
+    @property
+    def indirect_evidence(self) -> List[AffectedEvidenceItem]:
+        """All indirectly affected evidence items (transitive, depth > 1)."""
+        return [e for e in self.affected_evidence_items if e.impact_type != "DIRECT"]
+
+    def get_evidence_for_obligation(self, obligation_id: str) -> List[AffectedEvidenceItem]:
+        """Retrieve affected evidence items linked to a specific obligation ID."""
+        target = str(obligation_id).lower()
+        return [
+            e for e in self.affected_evidence_items
+            if (e.obligation_id and e.obligation_id.lower() == target)
+            or (e.root_obligation_id and e.root_obligation_id.lower() == target)
+        ]
+
+
+class TraverseImpactRequest(BaseModel):
+    """
+    Input request schema for graph-based impact traversal (Step 7.3).
+    """
+    comparison_result: Optional[ObligationComparisonResult] = Field(
+        default=None,
+        description="Comparison result from Step 7.2 containing classified obligation changes",
+    )
+    changed_obligations: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Explicit list of changed obligations (MODIFIED or REMOVED) to traverse",
+    )
+    obligation_ids: Optional[List[Union[str, UUID]]] = Field(
+        default=None,
+        description="Explicit list of obligation IDs to query in the graph",
+    )
+    max_depth: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description="Maximum graph traversal depth limit (default 2)",
+    )
+    include_dependencies: bool = Field(
+        default=True,
+        description="Whether to inspect DEPENDS_ON relationships",
+    )
+    include_supersedes: bool = Field(
+        default=True,
+        description="Whether to inspect SUPERSEDES relationships",
+    )
+    include_controls: bool = Field(
+        default=True,
+        description="Whether to inspect CATEGORIZED_AS control categories",
+    )
+    framework: Optional[str] = Field(
+        default=None,
+        description="Regulatory framework identifier override",
+    )
+    baseline_version: Optional[str] = Field(
+        default=None,
+        description="Baseline version identifier override",
+    )
+    draft_version: Optional[str] = Field(
+        default=None,
+        description="Draft version identifier override",
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+

@@ -485,6 +485,37 @@ class GraphService:
             rel_type=GraphRelationshipType.SATISFIES.value,
         )
 
+    async def get_evidence_for_obligation(
+        self,
+        obligation_id: Union[str, UUID],
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve all EvidenceArtifact nodes connected via SATISFIES to a given RegulatoryObligation.
+
+        :param obligation_id: ID of the RegulatoryObligation node
+        :return: List of record dictionaries containing evidence and relationship properties
+        """
+        query = """
+        MATCH (e:EvidenceArtifact)-[r:SATISFIES]-(o:RegulatoryObligation)
+        WHERE o.id = $obligation_id OR toString(o.id) = toString($obligation_id)
+        RETURN e.id AS evidence_id,
+               e.name AS evidence_name,
+               coalesce(e.title, e.name) AS evidence_title,
+               e.file_path AS file_path,
+               e.status AS evidence_status,
+               properties(e) AS evidence_properties,
+               type(r) AS relationship_type,
+               properties(r) AS relationship_properties,
+               coalesce(r.coverage_status, r.coverage, r.status, 'PENDING') AS coverage_status,
+               r.confidence AS confidence,
+               r.reasoning AS reasoning,
+               r.evidence_text AS evidence_text,
+               r.similarity_score AS similarity_score,
+               o.id AS obligation_id,
+               coalesce(o.clause, o.code, '') AS clause
+        """
+        return await self.execute_query(query, parameters={"obligation_id": str(obligation_id)})
+
     async def link_obligation_depends_on(
         self,
         source_obligation_id: Union[str, UUID],

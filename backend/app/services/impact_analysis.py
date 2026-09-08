@@ -1,5 +1,5 @@
 """
-Change Impact Analysis Service (Phase 2, Step 7.1 & 7.2).
+Change Impact Analysis Service (Phase 2, Step 7.1, 7.2 & 7.3).
 
 Accepts new or draft regulatory text, extracts discrete structured obligations
 using the existing ExtractionService (Phase 2, Step 3), validates them, and preserves
@@ -15,6 +15,17 @@ Step 7.2 compares existing baseline obligations against draft obligations:
   regulatory meaning/burdens changed.
 - Includes auditor-grade reasoning and confidence scores.
 - Preserves read-only safety (does not mutate the production regulatory graph).
+
+Step 7.3 traverses the Neo4j regulatory graph for MODIFIED and REMOVED obligations:
+- Queries Neo4j knowledge graph using reusable GraphService.
+- Identifies EvidenceArtifact nodes directly connected through SATISFIES (depth 1).
+- Inspects connected ControlCategory nodes through CATEGORIZED_AS.
+- Inspects connected RegulatoryObligation nodes through DEPENDS_ON and SUPERSEDES.
+- Transitively identifies indirect evidence connected to dependent/superseded obligations (depth 2).
+- Limits traversal depth to prevent runaway queries.
+- Preserves complete provenance linking every finding back to graph nodes.
+- Preserves relationship metadata (confidence, coverage_status, reasoning, similarity_score).
+- Read-only safety: does not yet permanently invalidate evidence.
 """
 
 import difflib
@@ -35,17 +46,25 @@ from app.integrations.qdrant_client import (
 )
 from app.schemas.extraction import ExtractedObligation
 from app.schemas.impact import (
+    AffectedControlItem,
+    AffectedEvidenceItem,
     CHANGE_ADDED,
     CHANGE_MODIFIED,
     CHANGE_REMOVED,
     CHANGE_UNCHANGED,
     CompareObligationsRequest,
+    DependentObligationItem,
     DraftExtractionResult,
     DraftObligation,
     DraftRegulationInput,
+    GraphImpactTraversalResult,
+    ImpactedObligationTraversal,
+    ImpactProvenance,
     ObligationChangeType,
     ObligationComparisonItem,
     ObligationComparisonResult,
+    SupersededObligationItem,
+    TraverseImpactRequest,
 )
 from app.services.extraction_service import (
     ExtractionService,
@@ -1373,10 +1392,717 @@ Return valid JSON:
             cleaned = match.group(1).strip()
         return json.loads(cleaned)
 
-    # Step 7.3 hook placeholder
-    # async def find_connected_evidence(...):
-    #     """Traverse graph to find evidence connected to impacted obligations (Step 7.3)."""
-    #     pass
+    # -------------------------------------------------------------------------
+    # Step 7.3: Graph-Based Impact Traversal
+    # -------------------------------------------------------------------------
+
+    async def find_connected_evidence(
+        self,
+        obligation_id: Union[str, UUID],
+        clause: Optional[str] = None,
+        code: Optional[str] = None,
+        title: Optional[str] = None,
+        change_type: Optional[str] = None,
+        reason: Optional[str] = None,
+        max_depth: int = 2,
+        include_dependencies: bool = True,
+        include_supersedes: bool = True,
+        include_controls: bool = True,
+    ) -> ImpactedObligationTraversal:
+        """
+        Traverse Neo4j regulatory graph for a single MODIFIED or REMOVED obligation (Phase 2, Step 7.3).
+
+        Traverses:
+        - Direct evidence connected via (EvidenceArtifact)-[:SATISFIES]->(RegulatoryObligation) [depth 1]
+        - Affected control categories via (RegulatoryObligation)-[:CATEGORIZED_AS]->(ControlCategory)
+        - Dependent obligations via (RegulatoryObligation)-[:DEPENDS_ON]-(RegulatoryObligation)
+        - Superseded obligations via (RegulatoryObligation)-[:SUPERSEDES]-(RegulatoryObligation)
+        - If max_depth >= 2, indirect evidence connected to dependent/superseded obligations via SATISFIES [depth 2]
+
+        Preserves provenance, existing coverage status, relationship metadata, and limits traversal depth.
+        Does not mutate or permanently invalidate evidence in the graph.
+
+        :param obligation_id: Baseline obligation ID (UUID or string)
+        :param clause: Optional obligation clause identifier (e.g. 'Article 5(1)(e)', 'CC6.1')
+        :param code: Optional obligation code identifier
+        :param title: Optional obligation title
+        :param change_type: Classification of change (e.g. 'MODIFIED' or 'REMOVED')
+        :param reason: Reason for obligation change
+        :param max_depth: Traversal depth limit (default 2, clamped between 1 and 5)
+        :param include_dependencies: Whether to traverse DEPENDS_ON edges
+        :param include_supersedes: Whether to traverse SUPERSEDES edges
+        :param include_controls: Whether to query CATEGORIZED_AS control categories
+        :return: ImpactedObligationTraversal containing connected evidence, controls, and dependencies
+        """
+        bounded_depth = max(1, min(int(max_depth), 5))
+        ob_id_str = str(obligation_id).strip() if obligation_id is not None else ""
+        clause_str = str(clause).strip() if clause else None
+        code_str = str(code).strip() if code else None
+
+        # 1. Query direct evidence via SATISFIES (Depth 1)
+        direct_evidence_records = await self._query_direct_evidence(
+            obligation_id=ob_id_str,
+            clause=clause_str,
+            code=code_str,
+        )
+
+        direct_evidence_items: List[AffectedEvidenceItem] = []
+        seen_evidence_ids: Set[str] = set()
+
+        for rec in direct_evidence_records:
+            ev_id = str(rec.get("evidence_id") or "")
+            if not ev_id:
+                continue
+            seen_evidence_ids.add(ev_id)
+
+            ev_name = str(rec.get("evidence_name") or rec.get("evidence_title") or "Unnamed Evidence")
+            rec_ob_id = str(rec.get("obligation_id") or ob_id_str)
+            rec_clause = rec.get("clause") or clause_str or code_str or ""
+            rec_cov = rec.get("coverage_status") or rec.get("coverage") or rec.get("status")
+
+            provenance = ImpactProvenance(
+                root_obligation_id=ob_id_str,
+                root_clause=clause_str or code_str,
+                target_node_id=ev_id,
+                target_node_label="EvidenceArtifact",
+                traversal_depth=1,
+                path_nodes=[
+                    {"label": "RegulatoryObligation", "id": rec_ob_id, "clause": rec_clause},
+                    {"label": "EvidenceArtifact", "id": ev_id, "name": ev_name},
+                ],
+                path_relationships=[
+                    {"type": "SATISFIES", "direction": "INCOMING", "properties": rec.get("relationship_properties") or {}},
+                ],
+                readable_path=f"RegulatoryObligation({rec_clause or rec_ob_id}) <-[:SATISFIES]- EvidenceArtifact({ev_name})",
+            )
+
+            direct_evidence_items.append(
+                AffectedEvidenceItem(
+                    evidence_id=ev_id,
+                    evidence_name=ev_name,
+                    evidence_title=rec.get("evidence_title"),
+                    file_path=rec.get("file_path"),
+                    evidence_status=rec.get("evidence_status"),
+                    obligation_id=rec_ob_id,
+                    clause=rec_clause,
+                    obligation_title=rec.get("obligation_title") or title,
+                    root_obligation_id=ob_id_str,
+                    root_clause=clause_str or code_str,
+                    change_type=change_type,
+                    impact_type="DIRECT",
+                    depth=1,
+                    coverage_status=rec_cov,
+                    confidence=float(rec["confidence"]) if rec.get("confidence") is not None else None,
+                    reasoning=rec.get("reasoning"),
+                    evidence_text=rec.get("evidence_text"),
+                    similarity_score=float(rec["similarity_score"]) if rec.get("similarity_score") is not None else None,
+                    relationship_type=rec.get("relationship_type") or "SATISFIES",
+                    relationship_direction="INCOMING",
+                    relationship_metadata=rec.get("relationship_properties") or {},
+                    provenance=provenance,
+                    metadata={"source": "direct_satisfies"},
+                )
+            )
+
+        # 2. Query affected control categories via CATEGORIZED_AS
+        affected_controls: List[AffectedControlItem] = []
+        if include_controls:
+            control_records = await self._query_affected_controls(
+                obligation_id=ob_id_str,
+                clause=clause_str,
+                code=code_str,
+            )
+            for cr in control_records:
+                c_id = str(cr.get("control_id") or "")
+                if c_id:
+                    affected_controls.append(
+                        AffectedControlItem(
+                            control_id=c_id,
+                            control_name=str(cr.get("control_name") or "Unnamed Control"),
+                            control_code=cr.get("control_code"),
+                            control_description=cr.get("control_description"),
+                            obligation_id=str(cr.get("obligation_id") or ob_id_str),
+                            clause=cr.get("clause") or clause_str,
+                            relationship_type=cr.get("relationship_type") or "CATEGORIZED_AS",
+                            relationship_metadata=cr.get("relationship_properties") or {},
+                        )
+                    )
+
+        # 3. Query dependent obligations via DEPENDS_ON
+        dependent_obligations: List[DependentObligationItem] = []
+        if include_dependencies:
+            dep_records = await self._query_dependent_obligations(
+                obligation_id=ob_id_str,
+                clause=clause_str,
+                code=code_str,
+            )
+            for dr in dep_records:
+                dep_id = str(dr.get("dependent_obligation_id") or "")
+                if dep_id:
+                    dependent_obligations.append(
+                        DependentObligationItem(
+                            obligation_id=dep_id,
+                            code=dr.get("code"),
+                            clause=dr.get("clause"),
+                            title=dr.get("title"),
+                            description=dr.get("description"),
+                            direction=dr.get("direction") or "OUTGOING",
+                            dependency_description=dr.get("dependency_description"),
+                            relationship_metadata=dr.get("relationship_properties") or {},
+                        )
+                    )
+
+        # 4. Query superseded obligations via SUPERSEDES
+        superseded_obligations: List[SupersededObligationItem] = []
+        if include_supersedes:
+            sup_records = await self._query_superseded_obligations(
+                obligation_id=ob_id_str,
+                clause=clause_str,
+                code=code_str,
+            )
+            for sr in sup_records:
+                sup_id = str(sr.get("superseded_obligation_id") or "")
+                if sup_id:
+                    superseded_obligations.append(
+                        SupersededObligationItem(
+                            obligation_id=sup_id,
+                            code=sr.get("code"),
+                            clause=sr.get("clause"),
+                            title=sr.get("title"),
+                            description=sr.get("description"),
+                            direction=sr.get("direction") or "OUTGOING",
+                            supersedes_reason=sr.get("supersedes_reason"),
+                            relationship_metadata=sr.get("relationship_properties") or {},
+                        )
+                    )
+
+        # 5. Query indirect evidence through dependencies / supersedes (Depth >= 2)
+        indirect_evidence_items: List[AffectedEvidenceItem] = []
+        if bounded_depth >= 2 and (include_dependencies or include_supersedes):
+            indirect_records = await self._query_indirect_evidence(
+                obligation_id=ob_id_str,
+                clause=clause_str,
+                code=code_str,
+                include_dependencies=include_dependencies,
+                include_supersedes=include_supersedes,
+            )
+            for ir in indirect_records:
+                ev_id = str(ir.get("evidence_id") or "")
+                if not ev_id or ev_id in seen_evidence_ids:
+                    # Skip if missing ID or already discovered at depth 1
+                    continue
+                seen_evidence_ids.add(ev_id)
+
+                ev_name = str(ir.get("evidence_name") or ir.get("evidence_title") or "Unnamed Evidence")
+                inter_ob_id = str(ir.get("intermediate_obligation_id") or "")
+                inter_clause = ir.get("intermediate_clause") or ""
+                hop_rel = ir.get("hop_relationship_type") or "DEPENDS_ON"
+                hop_dir = ir.get("hop_direction") or "OUTGOING"
+                rec_cov = ir.get("coverage_status") or ir.get("coverage") or ir.get("status")
+
+                hop_repr = f"-[:{hop_rel}]->" if hop_dir == "OUTGOING" else f"<-[:{hop_rel}]-"
+                readable_path = (
+                    f"RegulatoryObligation({clause_str or ob_id_str}) "
+                    f"{hop_repr} RegulatoryObligation({inter_clause or inter_ob_id}) "
+                    f"<-[:SATISFIES]- EvidenceArtifact({ev_name})"
+                )
+
+                provenance = ImpactProvenance(
+                    root_obligation_id=ob_id_str,
+                    root_clause=clause_str or code_str,
+                    target_node_id=ev_id,
+                    target_node_label="EvidenceArtifact",
+                    traversal_depth=2,
+                    path_nodes=[
+                        {"label": "RegulatoryObligation", "id": ob_id_str, "clause": clause_str or code_str},
+                        {"label": "RegulatoryObligation", "id": inter_ob_id, "clause": inter_clause},
+                        {"label": "EvidenceArtifact", "id": ev_id, "name": ev_name},
+                    ],
+                    path_relationships=[
+                        {"type": hop_rel, "direction": hop_dir, "properties": ir.get("hop_properties") or {}},
+                        {"type": "SATISFIES", "direction": "INCOMING", "properties": ir.get("relationship_properties") or {}},
+                    ],
+                    readable_path=readable_path,
+                )
+
+                merged_rel_meta = {
+                    **(ir.get("relationship_properties") or {}),
+                    "hop_relationship_type": hop_rel,
+                    "hop_direction": hop_dir,
+                    "intermediate_obligation_id": inter_ob_id,
+                    "intermediate_clause": inter_clause,
+                }
+
+                indirect_evidence_items.append(
+                    AffectedEvidenceItem(
+                        evidence_id=ev_id,
+                        evidence_name=ev_name,
+                        evidence_title=ir.get("evidence_title"),
+                        file_path=ir.get("file_path"),
+                        evidence_status=ir.get("evidence_status"),
+                        obligation_id=inter_ob_id,
+                        clause=inter_clause,
+                        obligation_title=ir.get("intermediate_title"),
+                        root_obligation_id=ob_id_str,
+                        root_clause=clause_str or code_str,
+                        change_type=change_type,
+                        impact_type="INDIRECT",
+                        depth=2,
+                        coverage_status=rec_cov,
+                        confidence=float(ir["confidence"]) if ir.get("confidence") is not None else None,
+                        reasoning=ir.get("reasoning"),
+                        evidence_text=ir.get("evidence_text"),
+                        similarity_score=float(ir["similarity_score"]) if ir.get("similarity_score") is not None else None,
+                        relationship_type=hop_rel,
+                        relationship_direction=hop_dir,
+                        relationship_metadata=merged_rel_meta,
+                        provenance=provenance,
+                        metadata={
+                            "source": "transitive_relationship",
+                            "hop_relationship": hop_rel,
+                            "intermediate_obligation_id": inter_ob_id,
+                        },
+                    )
+                )
+
+        return ImpactedObligationTraversal(
+            obligation_id=ob_id_str,
+            clause=clause_str or code_str,
+            title=title,
+            change_type=change_type,
+            reason=reason,
+            direct_evidence=direct_evidence_items,
+            indirect_evidence=indirect_evidence_items,
+            dependent_obligations=dependent_obligations,
+            superseded_obligations=superseded_obligations,
+            affected_controls=affected_controls,
+            metadata={
+                "max_depth": bounded_depth,
+                "direct_count": len(direct_evidence_items),
+                "indirect_count": len(indirect_evidence_items),
+                "dependent_count": len(dependent_obligations),
+                "superseded_count": len(superseded_obligations),
+                "control_count": len(affected_controls),
+            },
+        )
+
+    async def traverse_affected_evidence(
+        self,
+        comparison_result: Optional[Union[ObligationComparisonResult, Sequence[Union[ObligationComparisonItem, Dict[str, Any]]]]] = None,
+        changed_obligations: Optional[Sequence[Union[ObligationComparisonItem, Dict[str, Any]]]] = None,
+        obligation_ids: Optional[Sequence[Union[str, UUID]]] = None,
+        max_depth: int = 2,
+        include_dependencies: bool = True,
+        include_supersedes: bool = True,
+        include_controls: bool = True,
+        framework: Optional[str] = None,
+        baseline_version: Optional[str] = None,
+        draft_version: Optional[str] = None,
+    ) -> GraphImpactTraversalResult:
+        """
+        Traverse the regulatory compliance graph for all MODIFIED and REMOVED obligations (Phase 2, Step 7.3).
+
+        Accepts:
+        - ObligationComparisonResult (from Step 7.2)
+        - Sequence of ObligationComparisonItem or dicts
+        - Explicit list of obligation IDs / UUIDs
+
+        For each MODIFIED or REMOVED obligation:
+        - Queries Neo4j for connected evidence through SATISFIES
+        - Traverses relevant DEPENDS_ON, SUPERSEDES, and CATEGORIZED_AS control relationships
+        - Preserves relationship metadata and audit provenance
+        - Deduplicates and returns all affected evidence IDs and items
+
+        :param comparison_result: ObligationComparisonResult from Step 7.2 comparison
+        :param changed_obligations: Explicit list of changed obligation items or dicts
+        :param obligation_ids: Explicit list of obligation IDs to query
+        :param max_depth: Maximum traversal depth limit (default 2)
+        :param include_dependencies: Whether to traverse DEPENDS_ON relationships
+        :param include_supersedes: Whether to traverse SUPERSEDES relationships
+        :param include_controls: Whether to query CATEGORIZED_AS control categories
+        :param framework: Framework name override
+        :param baseline_version: Baseline version identifier override
+        :param draft_version: Draft version identifier override
+        :return: GraphImpactTraversalResult
+        """
+        # 1. Resolve framework & versions from comparison_result if present
+        fw = framework
+        b_ver = baseline_version
+        d_ver = draft_version
+
+        # 2. Extract changed items to evaluate
+        targets_to_traverse: List[Dict[str, Any]] = []
+
+        if isinstance(comparison_result, ObligationComparisonResult):
+            fw = fw or comparison_result.framework
+            b_ver = b_ver or comparison_result.baseline_version
+            d_ver = d_ver or comparison_result.draft_version
+            for item in comparison_result.changes:
+                c_type = item.change_type.value if hasattr(item.change_type, "value") else str(item.change_type).upper()
+                if c_type in (CHANGE_MODIFIED, CHANGE_REMOVED, "MODIFIED", "REMOVED"):
+                    targets_to_traverse.append({
+                        "id": item.old_obligation_id or item.new_obligation_id,
+                        "clause": item.old_clause or item.new_clause,
+                        "code": item.old_clause or item.new_clause,
+                        "title": None,
+                        "change_type": c_type,
+                        "reason": item.reason,
+                    })
+        elif isinstance(comparison_result, (list, tuple)):
+            for item in comparison_result:
+                if isinstance(item, ObligationComparisonItem):
+                    c_type = item.change_type.value if hasattr(item.change_type, "value") else str(item.change_type).upper()
+                    if c_type in (CHANGE_MODIFIED, CHANGE_REMOVED, "MODIFIED", "REMOVED"):
+                        targets_to_traverse.append({
+                            "id": item.old_obligation_id or item.new_obligation_id,
+                            "clause": item.old_clause or item.new_clause,
+                            "code": item.old_clause or item.new_clause,
+                            "title": None,
+                            "change_type": c_type,
+                            "reason": item.reason,
+                        })
+                elif isinstance(item, dict):
+                    c_type = str(item.get("change_type", "MODIFIED")).upper()
+                    if c_type in (CHANGE_MODIFIED, CHANGE_REMOVED, "MODIFIED", "REMOVED"):
+                        targets_to_traverse.append({
+                            "id": item.get("id") or item.get("old_obligation_id") or item.get("obligation_id"),
+                            "clause": item.get("clause") or item.get("old_clause"),
+                            "code": item.get("code") or item.get("clause") or item.get("old_clause"),
+                            "title": item.get("title"),
+                            "change_type": c_type,
+                            "reason": item.get("reason") or item.get("reasoning"),
+                        })
+
+        if changed_obligations:
+            for item in changed_obligations:
+                if isinstance(item, ObligationComparisonItem):
+                    c_type = item.change_type.value if hasattr(item.change_type, "value") else str(item.change_type).upper()
+                    if c_type in (CHANGE_MODIFIED, CHANGE_REMOVED, "MODIFIED", "REMOVED"):
+                        targets_to_traverse.append({
+                            "id": item.old_obligation_id or item.new_obligation_id,
+                            "clause": item.old_clause or item.new_clause,
+                            "code": item.old_clause or item.new_clause,
+                            "title": None,
+                            "change_type": c_type,
+                            "reason": item.reason,
+                        })
+                elif isinstance(item, dict):
+                    c_type = str(item.get("change_type", "MODIFIED")).upper()
+                    targets_to_traverse.append({
+                        "id": item.get("id") or item.get("old_obligation_id") or item.get("obligation_id"),
+                        "clause": item.get("clause") or item.get("old_clause"),
+                        "code": item.get("code") or item.get("clause") or item.get("old_clause"),
+                        "title": item.get("title"),
+                        "change_type": c_type,
+                        "reason": item.get("reason") or item.get("reasoning"),
+                    })
+
+        if obligation_ids:
+            for ob_id in obligation_ids:
+                targets_to_traverse.append({
+                    "id": str(ob_id),
+                    "clause": None,
+                    "code": None,
+                    "title": None,
+                    "change_type": "MODIFIED",
+                    "reason": "Direct obligation traversal request",
+                })
+
+        # 3. Deduplicate targets by (id, clause)
+        dedup_targets: List[Dict[str, Any]] = []
+        seen_targets: Set[Tuple[str, str]] = set()
+        for t in targets_to_traverse:
+            t_id = str(t.get("id") or "").strip().lower()
+            t_clause = str(t.get("clause") or "").strip().lower()
+            if not t_id and not t_clause:
+                continue
+            key = (t_id, t_clause)
+            if key not in seen_targets:
+                seen_targets.add(key)
+                dedup_targets.append(t)
+
+        logger.info(
+            f"Starting graph impact traversal for {len(dedup_targets)} modified/removed obligations "
+            f"(max_depth={max_depth}, dependencies={include_dependencies}, supersedes={include_supersedes})."
+        )
+
+        # 4. Perform traversal for each target obligation
+        traversals: List[ImpactedObligationTraversal] = []
+        all_affected_evidence_items: List[AffectedEvidenceItem] = []
+        seen_all_evidence_ids: Set[str] = set()
+        affected_evidence_ids: List[str] = []
+        seen_control_ids: Set[str] = set()
+        affected_control_ids: List[str] = []
+
+        for target in dedup_targets:
+            traversal = await self.find_connected_evidence(
+                obligation_id=target.get("id"),
+                clause=target.get("clause"),
+                code=target.get("code"),
+                title=target.get("title"),
+                change_type=target.get("change_type"),
+                reason=target.get("reason"),
+                max_depth=max_depth,
+                include_dependencies=include_dependencies,
+                include_supersedes=include_supersedes,
+                include_controls=include_controls,
+            )
+            traversals.append(traversal)
+
+            # Aggregate affected evidence items
+            for ev in traversal.all_evidence:
+                all_affected_evidence_items.append(ev)
+                if ev.evidence_id not in seen_all_evidence_ids:
+                    seen_all_evidence_ids.add(ev.evidence_id)
+                    affected_evidence_ids.append(ev.evidence_id)
+
+            # Aggregate control IDs
+            for ctrl in traversal.affected_controls:
+                if ctrl.control_id not in seen_control_ids:
+                    seen_control_ids.add(ctrl.control_id)
+                    affected_control_ids.append(ctrl.control_id)
+
+        logger.info(
+            f"Graph impact traversal complete: {len(traversals)} obligations analyzed, "
+            f"{len(affected_evidence_ids)} unique affected evidence artifacts found."
+        )
+
+        return GraphImpactTraversalResult(
+            framework=fw,
+            baseline_version=b_ver,
+            draft_version=d_ver,
+            traversals=traversals,
+            affected_evidence_items=all_affected_evidence_items,
+            affected_evidence_ids=affected_evidence_ids,
+            affected_control_ids=affected_control_ids,
+            total_impacted_obligations=len(traversals),
+            total_affected_evidence=len(affected_evidence_ids),
+            total_affected_controls=len(affected_control_ids),
+            max_depth=max_depth,
+            metadata={
+                "direct_evidence_count": sum(len(t.direct_evidence) for t in traversals),
+                "indirect_evidence_count": sum(len(t.indirect_evidence) for t in traversals),
+                "dependent_obligations_count": sum(len(t.dependent_obligations) for t in traversals),
+                "superseded_obligations_count": sum(len(t.superseded_obligations) for t in traversals),
+            },
+        )
+
+    # -------------------------------------------------------------------------
+    # Graph Traversal Cypher Query Helpers
+    # -------------------------------------------------------------------------
+
+    async def _query_direct_evidence(
+        self,
+        obligation_id: Optional[str] = None,
+        clause: Optional[str] = None,
+        code: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Query EvidenceArtifact nodes directly connected through SATISFIES (depth 1)."""
+        if not self.graph_service:
+            return []
+        query = """
+        MATCH (e:EvidenceArtifact)-[r:SATISFIES]-(o:RegulatoryObligation)
+        WHERE ($obligation_id IS NOT NULL AND (o.id = $obligation_id OR toString(o.id) = toString($obligation_id)))
+           OR ($clause IS NOT NULL AND (toLower(coalesce(o.clause, '')) = toLower($clause) OR toLower(coalesce(o.code, '')) = toLower($clause)))
+           OR ($code IS NOT NULL AND (toLower(coalesce(o.code, '')) = toLower($code) OR toLower(coalesce(o.clause, '')) = toLower($code)))
+        RETURN e.id AS evidence_id,
+               e.name AS evidence_name,
+               coalesce(e.title, e.name) AS evidence_title,
+               e.file_path AS file_path,
+               e.status AS evidence_status,
+               properties(e) AS evidence_properties,
+               type(r) AS relationship_type,
+               properties(r) AS relationship_properties,
+               coalesce(r.coverage_status, r.coverage, r.status, 'PENDING') AS coverage_status,
+               r.confidence AS confidence,
+               r.reasoning AS reasoning,
+               r.evidence_text AS evidence_text,
+               r.similarity_score AS similarity_score,
+               o.id AS obligation_id,
+               coalesce(o.clause, o.code, '') AS clause,
+               o.title AS obligation_title
+        """
+        params = {
+            "obligation_id": str(obligation_id) if obligation_id else None,
+            "clause": str(clause).strip() if clause else None,
+            "code": str(code).strip() if code else None,
+        }
+        try:
+            return await self.graph_service.execute_query(query, parameters=params)
+        except Exception as e:
+            logger.warning(f"Failed to query direct evidence for obligation '{obligation_id or clause}': {e}")
+            return []
+
+    async def _query_affected_controls(
+        self,
+        obligation_id: Optional[str] = None,
+        clause: Optional[str] = None,
+        code: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Query ControlCategory nodes connected through CATEGORIZED_AS."""
+        if not self.graph_service:
+            return []
+        query = """
+        MATCH (o:RegulatoryObligation)-[r:CATEGORIZED_AS]-(c:ControlCategory)
+        WHERE ($obligation_id IS NOT NULL AND (o.id = $obligation_id OR toString(o.id) = toString($obligation_id)))
+           OR ($clause IS NOT NULL AND (toLower(coalesce(o.clause, '')) = toLower($clause) OR toLower(coalesce(o.code, '')) = toLower($clause)))
+           OR ($code IS NOT NULL AND (toLower(coalesce(o.code, '')) = toLower($code) OR toLower(coalesce(o.clause, '')) = toLower($code)))
+        RETURN c.id AS control_id,
+               c.name AS control_name,
+               c.code AS control_code,
+               c.description AS control_description,
+               properties(c) AS control_properties,
+               type(r) AS relationship_type,
+               properties(r) AS relationship_properties,
+               o.id AS obligation_id,
+               coalesce(o.clause, o.code, '') AS clause
+        """
+        params = {
+            "obligation_id": str(obligation_id) if obligation_id else None,
+            "clause": str(clause).strip() if clause else None,
+            "code": str(code).strip() if code else None,
+        }
+        try:
+            return await self.graph_service.execute_query(query, parameters=params)
+        except Exception as e:
+            logger.warning(f"Failed to query affected controls for obligation '{obligation_id or clause}': {e}")
+            return []
+
+    async def _query_dependent_obligations(
+        self,
+        obligation_id: Optional[str] = None,
+        clause: Optional[str] = None,
+        code: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Query RegulatoryObligation nodes connected through DEPENDS_ON."""
+        if not self.graph_service:
+            return []
+        query = """
+        MATCH (o:RegulatoryObligation)-[r:DEPENDS_ON]-(dep:RegulatoryObligation)
+        WHERE ($obligation_id IS NOT NULL AND (o.id = $obligation_id OR toString(o.id) = toString($obligation_id)))
+           OR ($clause IS NOT NULL AND (toLower(coalesce(o.clause, '')) = toLower($clause) OR toLower(coalesce(o.code, '')) = toLower($clause)))
+           OR ($code IS NOT NULL AND (toLower(coalesce(o.code, '')) = toLower($code) OR toLower(coalesce(o.clause, '')) = toLower($code)))
+        RETURN dep.id AS dependent_obligation_id,
+               dep.code AS code,
+               dep.clause AS clause,
+               dep.title AS title,
+               coalesce(dep.description, dep.text) AS description,
+               properties(dep) AS properties,
+               type(r) AS relationship_type,
+               properties(r) AS relationship_properties,
+               CASE WHEN startNode(r) = o THEN 'OUTGOING' ELSE 'INCOMING' END AS direction,
+               r.description AS dependency_description,
+               o.id AS source_obligation_id,
+               coalesce(o.clause, o.code, '') AS source_clause
+        """
+        params = {
+            "obligation_id": str(obligation_id) if obligation_id else None,
+            "clause": str(clause).strip() if clause else None,
+            "code": str(code).strip() if code else None,
+        }
+        try:
+            return await self.graph_service.execute_query(query, parameters=params)
+        except Exception as e:
+            logger.warning(f"Failed to query dependent obligations for '{obligation_id or clause}': {e}")
+            return []
+
+    async def _query_superseded_obligations(
+        self,
+        obligation_id: Optional[str] = None,
+        clause: Optional[str] = None,
+        code: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Query RegulatoryObligation nodes connected through SUPERSEDES."""
+        if not self.graph_service:
+            return []
+        query = """
+        MATCH (o:RegulatoryObligation)-[r:SUPERSEDES]-(sup:RegulatoryObligation)
+        WHERE ($obligation_id IS NOT NULL AND (o.id = $obligation_id OR toString(o.id) = toString($obligation_id)))
+           OR ($clause IS NOT NULL AND (toLower(coalesce(o.clause, '')) = toLower($clause) OR toLower(coalesce(o.code, '')) = toLower($clause)))
+           OR ($code IS NOT NULL AND (toLower(coalesce(o.code, '')) = toLower($code) OR toLower(coalesce(o.clause, '')) = toLower($code)))
+        RETURN sup.id AS superseded_obligation_id,
+               sup.code AS code,
+               sup.clause AS clause,
+               sup.title AS title,
+               coalesce(sup.description, sup.text) AS description,
+               properties(sup) AS properties,
+               type(r) AS relationship_type,
+               properties(r) AS relationship_properties,
+               CASE WHEN startNode(r) = o THEN 'OUTGOING' ELSE 'INCOMING' END AS direction,
+               r.reason AS supersedes_reason,
+               o.id AS source_obligation_id,
+               coalesce(o.clause, o.code, '') AS source_clause
+        """
+        params = {
+            "obligation_id": str(obligation_id) if obligation_id else None,
+            "clause": str(clause).strip() if clause else None,
+            "code": str(code).strip() if code else None,
+        }
+        try:
+            return await self.graph_service.execute_query(query, parameters=params)
+        except Exception as e:
+            logger.warning(f"Failed to query superseded obligations for '{obligation_id or clause}': {e}")
+            return []
+
+    async def _query_indirect_evidence(
+        self,
+        obligation_id: Optional[str] = None,
+        clause: Optional[str] = None,
+        code: Optional[str] = None,
+        include_dependencies: bool = True,
+        include_supersedes: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Query EvidenceArtifact nodes connected through DEPENDS_ON or SUPERSEDES (depth 2)."""
+        if not self.graph_service:
+            return []
+
+        rel_types = []
+        if include_dependencies:
+            rel_types.append("DEPENDS_ON")
+        if include_supersedes:
+            rel_types.append("SUPERSEDES")
+        if not rel_types:
+            return []
+
+        rel_type_pattern = "|".join(rel_types)
+
+        query = f"""
+        MATCH (e:EvidenceArtifact)-[r_sat:SATISFIES]-(rel_ob:RegulatoryObligation)-[r_link:{rel_type_pattern}]-(o:RegulatoryObligation)
+        WHERE ($obligation_id IS NOT NULL AND (o.id = $obligation_id OR toString(o.id) = toString($obligation_id)))
+           OR ($clause IS NOT NULL AND (toLower(coalesce(o.clause, '')) = toLower($clause) OR toLower(coalesce(o.code, '')) = toLower($clause)))
+           OR ($code IS NOT NULL AND (toLower(coalesce(o.code, '')) = toLower($code) OR toLower(coalesce(o.clause, '')) = toLower($code)))
+        RETURN e.id AS evidence_id,
+               e.name AS evidence_name,
+               coalesce(e.title, e.name) AS evidence_title,
+               e.file_path AS file_path,
+               e.status AS evidence_status,
+               properties(e) AS evidence_properties,
+               type(r_sat) AS relationship_type,
+               properties(r_sat) AS relationship_properties,
+               coalesce(r_sat.coverage_status, r_sat.coverage, r_sat.status, 'PENDING') AS coverage_status,
+               r_sat.confidence AS confidence,
+               r_sat.reasoning AS reasoning,
+               r_sat.evidence_text AS evidence_text,
+               r_sat.similarity_score AS similarity_score,
+               rel_ob.id AS intermediate_obligation_id,
+               coalesce(rel_ob.clause, rel_ob.code, '') AS intermediate_clause,
+               rel_ob.title AS intermediate_title,
+               type(r_link) AS hop_relationship_type,
+               properties(r_link) AS hop_properties,
+               CASE WHEN startNode(r_link) = o THEN 'OUTGOING' ELSE 'INCOMING' END AS hop_direction,
+               o.id AS root_obligation_id,
+               coalesce(o.clause, o.code, '') AS root_clause
+        """
+        params = {
+            "obligation_id": str(obligation_id) if obligation_id else None,
+            "clause": str(clause).strip() if clause else None,
+            "code": str(code).strip() if code else None,
+        }
+        try:
+            return await self.graph_service.execute_query(query, parameters=params)
+        except Exception as e:
+            logger.warning(f"Failed to query indirect evidence for '{obligation_id or clause}': {e}")
+            return []
 
     # Step 7.4 hook placeholder
     # async def mark_evidence_potentially_invalid(...):
@@ -1497,3 +2223,63 @@ async def load_existing_obligations(
         version_id=version_id,
         db_session=db_session,
     )
+
+
+async def traverse_affected_evidence(
+    comparison_result: Optional[Union[ObligationComparisonResult, Sequence[Union[ObligationComparisonItem, Dict[str, Any]]]]] = None,
+    changed_obligations: Optional[Sequence[Union[ObligationComparisonItem, Dict[str, Any]]]] = None,
+    obligation_ids: Optional[Sequence[Union[str, UUID]]] = None,
+    max_depth: int = 2,
+    include_dependencies: bool = True,
+    include_supersedes: bool = True,
+    include_controls: bool = True,
+    framework: Optional[str] = None,
+    baseline_version: Optional[str] = None,
+    draft_version: Optional[str] = None,
+) -> GraphImpactTraversalResult:
+    """
+    Top-level convenience function for Phase 2 Step 7.3: Graph-based impact traversal.
+    Traverses Neo4j for all MODIFIED and REMOVED obligations and discovers connected evidence.
+    """
+    return await impact_analysis_service.traverse_affected_evidence(
+        comparison_result=comparison_result,
+        changed_obligations=changed_obligations,
+        obligation_ids=obligation_ids,
+        max_depth=max_depth,
+        include_dependencies=include_dependencies,
+        include_supersedes=include_supersedes,
+        include_controls=include_controls,
+        framework=framework,
+        baseline_version=baseline_version,
+        draft_version=draft_version,
+    )
+
+
+async def find_connected_evidence(
+    obligation_id: Union[str, UUID],
+    clause: Optional[str] = None,
+    code: Optional[str] = None,
+    title: Optional[str] = None,
+    change_type: Optional[str] = None,
+    reason: Optional[str] = None,
+    max_depth: int = 2,
+    include_dependencies: bool = True,
+    include_supersedes: bool = True,
+    include_controls: bool = True,
+) -> ImpactedObligationTraversal:
+    """
+    Top-level convenience function for Phase 2 Step 7.3: Find connected evidence for a single obligation.
+    """
+    return await impact_analysis_service.find_connected_evidence(
+        obligation_id=obligation_id,
+        clause=clause,
+        code=code,
+        title=title,
+        change_type=change_type,
+        reason=reason,
+        max_depth=max_depth,
+        include_dependencies=include_dependencies,
+        include_supersedes=include_supersedes,
+        include_controls=include_controls,
+    )
+

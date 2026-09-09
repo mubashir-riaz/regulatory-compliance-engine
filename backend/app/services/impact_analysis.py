@@ -1,10 +1,11 @@
 """
-Change Impact Analysis Service (Phase 2, Step 7.1, 7.2, 7.3 & 7.4).
+Change Impact Analysis Service (Phase 2, Step 7.1, 7.2, 7.3, 7.4 & 7.5).
 
 Accepts new or draft regulatory text, extracts discrete structured obligations
 using the existing ExtractionService (Phase 2, Step 3), validates them, and preserves
 key identifiers (clause, text, category, mandatory, keywords, IDs) for downstream
-change comparison (Step 7.2), graph traversal (Step 7.3), and invalidation reporting (Step 7.4).
+change comparison (Step 7.2), graph traversal (Step 7.3), invalidation reporting (Step 7.4),
+and unified impact reporting (Step 7.5).
 
 Step 7.2 compares existing baseline obligations against draft obligations:
 - Loads existing obligations for selected framework/version from Neo4j/SQL.
@@ -33,8 +34,14 @@ Step 7.4 flags impacted evidence artifacts for compliance review:
 - Stores evidence ID, affected obligation ID, change type, reason, and impact confidence.
 - Guarantees idempotency (repeat executions update existing records without creating duplicates).
 - Keeps draft-impact findings separate from approved regulatory compliance state.
+
+Step 7.5 synthesizes audit-ready Change Impact Reports and serves the API endpoint:
+- Generates unified ImpactAnalysisReport containing summary metrics, detected changes,
+  affected evidence artifacts, affected controls, and auditor reasoning with traceable IDs.
+- Provides POST /api/v1/impact/analyze with tenant isolation and read-only safety.
 """
 
+from datetime import datetime
 import difflib
 import json
 import logging
@@ -54,7 +61,9 @@ from app.integrations.qdrant_client import (
 from app.schemas.extraction import ExtractedObligation
 from app.schemas.impact import (
     AffectedControlItem,
+    AffectedControlReportItem,
     AffectedEvidenceItem,
+    AffectedEvidenceReportItem,
     CHANGE_ADDED,
     CHANGE_MODIFIED,
     CHANGE_REMOVED,
@@ -69,8 +78,12 @@ from app.schemas.impact import (
     FlagEvidenceRequest,
     FlaggedEvidenceRecord,
     GraphImpactTraversalResult,
+    ImpactAnalysisReport,
+    ImpactAnalysisRequest,
     ImpactedObligationTraversal,
     ImpactProvenance,
+    ImpactSummary,
+    ObligationChangeReportItem,
     ObligationChangeType,
     ObligationComparisonItem,
     ObligationComparisonResult,
@@ -2435,10 +2448,291 @@ Return valid JSON:
         )
 
 
-    # Step 7.5 hook placeholder
-    # async def generate_impact_report(...):
-    #     """Synthesize audit-ready change impact report (Step 7.5)."""
-    #     pass
+    # -------------------------------------------------------------------------
+    # Step 7.5: Impact Report & Synthesis
+    # -------------------------------------------------------------------------
+
+    async def generate_impact_report(
+        self,
+        draft_input: Union[str, DraftRegulationInput, DraftExtractionResult, Sequence[Union[DraftObligation, Dict[str, Any]]], Dict[str, Any]],
+        framework: Optional[str] = None,
+        current_version: Optional[str] = None,
+        draft_version: Optional[str] = None,
+        existing_obligations: Optional[Sequence[Union[Dict[str, Any], DraftObligation, Any]]] = None,
+        existing_version_id: Optional[Union[str, UUID]] = None,
+        similarity_threshold: float = 0.65,
+        max_depth: int = 2,
+        store_flags: bool = False,
+        tenant_id: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        use_llm: bool = True,
+        db_session: Optional[AsyncSession] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> ImpactAnalysisReport:
+        """
+        Execute the complete end-to-end Change Impact Analysis pipeline (Phase 2, Step 7.5).
+
+        Pipeline Stages:
+        1. Step 7.1: Extract discrete structured obligations from draft regulatory text.
+        2. Step 7.2: Compare draft obligations against baseline obligations, classifying changes into
+           ADDED, MODIFIED, REMOVED, or UNCHANGED.
+        3. Step 7.3: Traverse Neo4j regulatory graph for all MODIFIED and REMOVED obligations to discover
+           affected evidence artifacts, control categories, and dependencies.
+        4. Step 7.4: Flag affected evidence with non-destructive status (NEEDS_REVIEW) while strictly
+           preserving existing coverage information and keeping draft findings isolated.
+        5. Step 7.5: Synthesize and return unified audit-grade ImpactAnalysisReport.
+
+        Safety & Integrity:
+        - By default `store_flags=False`, preserving read-only safety for draft evaluations.
+        - Existing approved SATISFIES relationships and regulatory states are NEVER overwritten.
+
+        :param draft_input: Raw draft text, DraftRegulationInput, DraftExtractionResult, or obligation list
+        :param framework: Framework identifier (e.g. 'GDPR', 'SOC 2')
+        :param current_version: Baseline or current regulatory version (e.g. '2016', '2024')
+        :param draft_version: Draft or amendment version identifier (e.g. '2024-draft')
+        :param existing_obligations: Optional explicit list of baseline obligations
+        :param existing_version_id: Optional UUID of existing baseline regulatory version
+        :param similarity_threshold: Minimum semantic matching threshold (default 0.65)
+        :param max_depth: Maximum graph traversal depth for finding evidence (default 2)
+        :param store_flags: Whether to persist review flags in Neo4j (default False)
+        :param tenant_id: Optional tenant identifier for multi-tenant isolation
+        :param provider: LLM provider override ('groq' or 'gemini')
+        :param model: LLM model identifier override
+        :param use_llm: Whether to invoke LLM for subtle meaning comparison
+        :param db_session: Optional SQLAlchemy session for loading baseline obligations
+        :param metadata: Optional extra metadata dictionary
+        :return: ImpactAnalysisReport
+        """
+        start_time = datetime.utcnow()
+        fw = framework
+        baseline_ver = current_version
+        target_draft_ver = draft_version or "draft-amendment"
+        meta: Dict[str, Any] = dict(metadata or {})
+        if tenant_id:
+            meta["tenant_id"] = str(tenant_id)
+
+        # 1. Step 7.1: Extraction of Draft Obligations (if not already extracted)
+        extracted_draft_obs: List[Union[DraftObligation, Dict[str, Any]]] = []
+        raw_text_length = 0
+
+        if isinstance(draft_input, DraftExtractionResult):
+            extracted_draft_obs = list(draft_input.obligations)
+            fw = fw or draft_input.framework
+            target_draft_ver = draft_version or draft_input.version or target_draft_ver
+            raw_text_length = draft_input.raw_text_length
+        elif isinstance(draft_input, (list, tuple)):
+            extracted_draft_obs = list(draft_input)
+        elif isinstance(draft_input, (str, DraftRegulationInput, dict)):
+            extraction_result = await self.extract_draft_obligations(
+                draft_input=draft_input,
+                framework=fw,
+                version=target_draft_ver,
+                provider=provider,
+                model=model,
+                metadata={"tenant_id": tenant_id} if tenant_id else None,
+            )
+            extracted_draft_obs = list(extraction_result.obligations)
+            fw = fw or extraction_result.framework
+            target_draft_ver = draft_version or extraction_result.version or target_draft_ver
+            raw_text_length = extraction_result.raw_text_length
+        else:
+            logger.warning(f"Unrecognized draft_input type: {type(draft_input).__name__}")
+
+        # 2. Step 7.2: Compare Draft Obligations with Existing Baseline Obligations
+        comparison_result = await self.compare_obligations(
+            draft_obligations=extracted_draft_obs,
+            existing_obligations=existing_obligations,
+            framework=fw,
+            baseline_version=baseline_ver,
+            draft_version=target_draft_ver,
+            existing_version_id=existing_version_id,
+            db_session=db_session,
+            provider=provider,
+            model=model,
+            similarity_threshold=similarity_threshold,
+            use_llm=use_llm,
+        )
+
+        fw = fw or comparison_result.framework
+        baseline_ver = baseline_ver or comparison_result.baseline_version
+        target_draft_ver = target_draft_ver or comparison_result.draft_version
+
+        # 3. Step 7.3: Graph Impact Traversal (depth 1 to max_depth)
+        traversal_result = await self.traverse_affected_evidence(
+            comparison_result=comparison_result,
+            max_depth=max_depth,
+            include_dependencies=True,
+            include_supersedes=True,
+            include_controls=True,
+            framework=fw,
+            baseline_version=baseline_ver,
+            draft_version=target_draft_ver,
+        )
+
+        # 4. Step 7.4: Flag Potentially Invalid Evidence
+        flagged_result = await self.flag_impacted_evidence(
+            traversal_result=traversal_result,
+            default_status=EvidenceReviewStatus.NEEDS_REVIEW,
+            store_in_graph=store_flags,
+            update_relationship=store_flags,
+            create_impact_nodes=store_flags,
+            framework=fw,
+            baseline_version=baseline_ver,
+            draft_version=target_draft_ver,
+        )
+
+        # 5. Step 7.5: Synthesize Unified Impact Analysis Report
+        # Changes items
+        all_changes: List[ObligationChangeReportItem] = []
+        added_obs: List[ObligationChangeReportItem] = []
+        modified_obs: List[ObligationChangeReportItem] = []
+        removed_obs: List[ObligationChangeReportItem] = []
+
+        for ch in comparison_result.changes:
+            c_type = ch.change_type.value if hasattr(ch.change_type, "value") else str(ch.change_type).upper()
+            ob_id = ch.old_obligation_id or ch.new_obligation_id
+            clause = ch.old_clause or ch.new_clause
+            item = ObligationChangeReportItem(
+                obligation_id=ob_id,
+                clause=clause,
+                change_type=c_type,
+                reason=ch.reason,
+                confidence=ch.confidence,
+                category=ch.category,
+                old_text=ch.old_text,
+                new_text=ch.new_text,
+                similarity_score=ch.similarity_score,
+            )
+            all_changes.append(item)
+            if c_type == CHANGE_ADDED or c_type == "ADDED":
+                added_obs.append(item)
+            elif c_type == CHANGE_MODIFIED or c_type == "MODIFIED":
+                modified_obs.append(item)
+            elif c_type == CHANGE_REMOVED or c_type == "REMOVED":
+                removed_obs.append(item)
+
+        # Affected evidence items
+        affected_evidence_items: List[AffectedEvidenceReportItem] = []
+        for fe in flagged_result.flagged_items:
+            affected_evidence_items.append(
+                AffectedEvidenceReportItem(
+                    evidence_id=fe.evidence_id,
+                    status=fe.status if isinstance(fe.status, str) else fe.status.value,
+                    reason=fe.reason,
+                    obligation_id=fe.obligation_id,
+                    clause=fe.clause,
+                    change_type=fe.change_type,
+                    confidence=fe.impact_confidence,
+                    evidence_name=fe.evidence_name,
+                    previous_coverage_status=fe.previous_coverage_status,
+                    impact_type=fe.impact_type,
+                )
+            )
+
+        # Affected controls items
+        affected_control_items: List[AffectedControlReportItem] = []
+        seen_controls: Set[str] = set()
+        for tr in traversal_result.traversals:
+            for ctrl in tr.affected_controls:
+                ctrl_id = str(ctrl.control_id)
+                if ctrl_id not in seen_controls:
+                    seen_controls.add(ctrl_id)
+                    affected_control_items.append(
+                        AffectedControlReportItem(
+                            control_id=ctrl.control_id,
+                            control_name=ctrl.control_name,
+                            control_code=ctrl.control_code,
+                            obligation_id=ctrl.obligation_id,
+                            clause=ctrl.clause,
+                        )
+                    )
+
+        # Summary counts
+        summary = ImpactSummary(
+            added=len(added_obs),
+            modified=len(modified_obs),
+            removed=len(removed_obs),
+            unchanged=comparison_result.summary.get("UNCHANGED", 0),
+            total_obligations_reviewed=len(all_changes),
+            affected_evidence=len(flagged_result.unique_evidence_ids),
+            affected_controls=len(affected_control_items),
+        )
+
+        end_time = datetime.utcnow()
+        elapsed_sec = round((end_time - start_time).total_seconds(), 3)
+
+        report_metadata = {
+            "execution_time_seconds": elapsed_sec,
+            "raw_text_length": raw_text_length,
+            "total_draft_obligations": len(extracted_draft_obs),
+            "max_traversal_depth": max_depth,
+            "store_flags_in_graph": store_flags,
+            "provider": provider or self.provider,
+            "tenant_id": tenant_id,
+            "timestamp": end_time.isoformat(),
+            **meta,
+        }
+
+        logger.info(
+            f"Impact report generated for framework='{fw}', baseline='{baseline_ver}', "
+            f"draft='{target_draft_ver}': {summary.added} added, {summary.modified} modified, "
+            f"{summary.removed} removed, {summary.affected_evidence} affected evidence."
+        )
+
+        return ImpactAnalysisReport(
+            framework=fw,
+            baseline_version=baseline_ver,
+            draft_version=target_draft_ver,
+            summary=summary,
+            changes=all_changes,
+            added_obligations=added_obs,
+            modified_obligations=modified_obs,
+            removed_obligations=removed_obs,
+            affected_evidence=affected_evidence_items,
+            affected_controls=affected_control_items,
+            metadata=report_metadata,
+        )
+
+    async def analyze_impact(
+        self,
+        draft_input: Union[str, DraftRegulationInput, DraftExtractionResult, Sequence[Union[DraftObligation, Dict[str, Any]]], Dict[str, Any]],
+        framework: Optional[str] = None,
+        current_version: Optional[str] = None,
+        draft_version: Optional[str] = None,
+        existing_obligations: Optional[Sequence[Union[Dict[str, Any], DraftObligation, Any]]] = None,
+        existing_version_id: Optional[Union[str, UUID]] = None,
+        similarity_threshold: float = 0.65,
+        max_depth: int = 2,
+        store_flags: bool = False,
+        tenant_id: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        use_llm: bool = True,
+        db_session: Optional[AsyncSession] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> ImpactAnalysisReport:
+        """
+        Convenience alias for generate_impact_report (Phase 2, Step 7.5).
+        """
+        return await self.generate_impact_report(
+            draft_input=draft_input,
+            framework=framework,
+            current_version=current_version,
+            draft_version=draft_version,
+            existing_obligations=existing_obligations,
+            existing_version_id=existing_version_id,
+            similarity_threshold=similarity_threshold,
+            max_depth=max_depth,
+            store_flags=store_flags,
+            tenant_id=tenant_id,
+            provider=provider,
+            model=model,
+            use_llm=use_llm,
+            db_session=db_session,
+            metadata=metadata,
+        )
+
 
 
 # Global singleton instance for impact analysis
@@ -2672,5 +2966,84 @@ async def mark_evidence_potentially_invalid(
         draft_version=draft_version,
         custom_reason=custom_reason,
     )
+
+
+async def generate_impact_report(
+    draft_input: Union[str, DraftRegulationInput, DraftExtractionResult, Sequence[Union[DraftObligation, Dict[str, Any]]], Dict[str, Any]],
+    framework: Optional[str] = None,
+    current_version: Optional[str] = None,
+    draft_version: Optional[str] = None,
+    existing_obligations: Optional[Sequence[Union[Dict[str, Any], DraftObligation, Any]]] = None,
+    existing_version_id: Optional[Union[str, UUID]] = None,
+    similarity_threshold: float = 0.65,
+    max_depth: int = 2,
+    store_flags: bool = False,
+    tenant_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    use_llm: bool = True,
+    db_session: Optional[AsyncSession] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> ImpactAnalysisReport:
+    """
+    Top-level convenience function for Phase 2 Step 7.5: Generate Impact Analysis Report.
+    """
+    return await impact_analysis_service.generate_impact_report(
+        draft_input=draft_input,
+        framework=framework,
+        current_version=current_version,
+        draft_version=draft_version,
+        existing_obligations=existing_obligations,
+        existing_version_id=existing_version_id,
+        similarity_threshold=similarity_threshold,
+        max_depth=max_depth,
+        store_flags=store_flags,
+        tenant_id=tenant_id,
+        provider=provider,
+        model=model,
+        use_llm=use_llm,
+        db_session=db_session,
+        metadata=metadata,
+    )
+
+
+async def analyze_impact(
+    draft_input: Union[str, DraftRegulationInput, DraftExtractionResult, Sequence[Union[DraftObligation, Dict[str, Any]]], Dict[str, Any]],
+    framework: Optional[str] = None,
+    current_version: Optional[str] = None,
+    draft_version: Optional[str] = None,
+    existing_obligations: Optional[Sequence[Union[Dict[str, Any], DraftObligation, Any]]] = None,
+    existing_version_id: Optional[Union[str, UUID]] = None,
+    similarity_threshold: float = 0.65,
+    max_depth: int = 2,
+    store_flags: bool = False,
+    tenant_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    use_llm: bool = True,
+    db_session: Optional[AsyncSession] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> ImpactAnalysisReport:
+    """
+    Top-level convenience function alias for Phase 2 Step 7.5: Analyze Impact.
+    """
+    return await impact_analysis_service.analyze_impact(
+        draft_input=draft_input,
+        framework=framework,
+        current_version=current_version,
+        draft_version=draft_version,
+        existing_obligations=existing_obligations,
+        existing_version_id=existing_version_id,
+        similarity_threshold=similarity_threshold,
+        max_depth=max_depth,
+        store_flags=store_flags,
+        tenant_id=tenant_id,
+        provider=provider,
+        model=model,
+        use_llm=use_llm,
+        db_session=db_session,
+        metadata=metadata,
+    )
+
 
 

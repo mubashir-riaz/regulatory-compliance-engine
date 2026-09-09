@@ -1155,4 +1155,272 @@ class FlagEvidenceRequest(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+# =============================================================================
+# Phase 2 Step 7.5: Impact Report & API Schemas
+# =============================================================================
+
+
+class ImpactSummary(BaseModel):
+    """
+    Summary counts of obligation changes and affected downstream entities (Step 7.5).
+    """
+    added: int = Field(default=0, description="Count of newly added obligations")
+    modified: int = Field(default=0, description="Count of modified obligations")
+    removed: int = Field(default=0, description="Count of removed obligations")
+    unchanged: int = Field(default=0, description="Count of unchanged obligations")
+    total_obligations_reviewed: int = Field(default=0, description="Total obligations evaluated")
+    affected_evidence: int = Field(default=0, description="Count of unique affected evidence artifacts")
+    affected_controls: int = Field(default=0, description="Count of unique affected control categories")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ObligationChangeReportItem(BaseModel):
+    """
+    Report item detailing a changed obligation (Step 7.5).
+    """
+    obligation_id: Optional[str] = Field(
+        default=None,
+        description="Identifier of the obligation for audit traceability",
+    )
+    clause: Optional[str] = Field(
+        default=None,
+        description="Clause or article identifier (e.g. 'Article 5(1)(e)')",
+    )
+    change_type: str = Field(
+        ...,
+        description="Classification of change: ADDED, MODIFIED, REMOVED, or UNCHANGED",
+    )
+    reason: str = Field(
+        ...,
+        description="Auditor reasoning explaining why the obligation changed",
+    )
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score of the change classification",
+    )
+    category: Optional[str] = Field(
+        default=None,
+        description="Regulatory domain or control category",
+    )
+    old_text: Optional[str] = Field(
+        default=None,
+        description="Baseline requirement statement",
+    )
+    new_text: Optional[str] = Field(
+        default=None,
+        description="Draft requirement statement",
+    )
+    similarity_score: Optional[float] = Field(
+        default=None,
+        description="Semantic similarity score where applicable",
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AffectedEvidenceReportItem(BaseModel):
+    """
+    Report item detailing an impacted evidence artifact (Step 7.5).
+    """
+    evidence_id: str = Field(
+        ...,
+        description="Unique identifier of the evidence artifact",
+    )
+    status: str = Field(
+        default="NEEDS_REVIEW",
+        description="Non-destructive review status: 'NEEDS_REVIEW' or 'POTENTIALLY_INVALID'",
+    )
+    reason: str = Field(
+        ...,
+        description="Auditor rationale explaining why this evidence requires compliance review",
+    )
+    obligation_id: Optional[str] = Field(
+        default=None,
+        description="Connected obligation identifier for traceability",
+    )
+    clause: Optional[str] = Field(
+        default=None,
+        description="Connected obligation clause or code (e.g. 'Article 5(1)(e)')",
+    )
+    change_type: Optional[str] = Field(
+        default=None,
+        description="Change classification of the connected obligation ('MODIFIED' or 'REMOVED')",
+    )
+    confidence: Optional[float] = Field(
+        default=None,
+        description="Impact confidence score where available",
+    )
+    evidence_name: Optional[str] = Field(
+        default=None,
+        description="Display name or file name of the evidence artifact",
+    )
+    previous_coverage_status: Optional[str] = Field(
+        default=None,
+        description="Preserved previous coverage status from SATISFIES edge (e.g. 'FULL', 'PARTIAL')",
+    )
+    impact_type: Optional[str] = Field(
+        default="DIRECT",
+        description="Impact traversal type: 'DIRECT' or 'INDIRECT'",
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AffectedControlReportItem(BaseModel):
+    """
+    Report item detailing an affected control category (Step 7.5).
+    """
+    control_id: str = Field(
+        ...,
+        description="Unique identifier of the control category node",
+    )
+    control_name: str = Field(
+        ...,
+        description="Name of the control category (e.g. 'Access Control')",
+    )
+    control_code: Optional[str] = Field(
+        default=None,
+        description="Code of the control category (e.g. 'AC')",
+    )
+    obligation_id: Optional[str] = Field(
+        default=None,
+        description="Connected obligation identifier",
+    )
+    clause: Optional[str] = Field(
+        default=None,
+        description="Connected obligation clause",
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ImpactAnalysisReport(BaseModel):
+    """
+    Unified Regulatory Change Impact Analysis Report (Phase 2, Step 7.5).
+
+    Returns summary counts, detected obligation changes, flagged affected evidence,
+    and affected control categories with full audit traceability.
+    """
+    framework: Optional[str] = Field(
+        default=None,
+        description="Regulatory framework identifier (e.g. 'GDPR', 'SOC 2')",
+    )
+    baseline_version: Optional[str] = Field(
+        default=None,
+        description="Baseline regulatory version compared against (e.g. '2016', '2024')",
+    )
+    draft_version: Optional[str] = Field(
+        default=None,
+        description="Draft version identifier analyzed (e.g. '2024-draft')",
+    )
+    summary: ImpactSummary = Field(
+        ...,
+        description="Summary counts of obligation changes and impacted entities",
+    )
+    changes: List[ObligationChangeReportItem] = Field(
+        default_factory=list,
+        description="List of detected obligation changes (ADDED, MODIFIED, REMOVED, UNCHANGED)",
+    )
+    added_obligations: List[ObligationChangeReportItem] = Field(
+        default_factory=list,
+        description="Newly added regulatory obligations",
+    )
+    modified_obligations: List[ObligationChangeReportItem] = Field(
+        default_factory=list,
+        description="Modified regulatory obligations",
+    )
+    removed_obligations: List[ObligationChangeReportItem] = Field(
+        default_factory=list,
+        description="Removed regulatory obligations",
+    )
+    affected_evidence: List[AffectedEvidenceReportItem] = Field(
+        default_factory=list,
+        description="Evidence artifacts requiring compliance review",
+    )
+    affected_controls: List[AffectedControlReportItem] = Field(
+        default_factory=list,
+        description="Control categories connected to changed obligations",
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Audit metadata including timestamps, model information, and tenant tracking",
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ImpactAnalysisRequest(BaseModel):
+    """
+    Request payload for POST /api/v1/impact/analyze endpoint (Phase 2, Step 7.5).
+    """
+    draft_text: str = Field(
+        ...,
+        description="Raw or chunked text of the draft regulation or amendment to analyze",
+    )
+    framework: Optional[str] = Field(
+        default=None,
+        description="Regulatory framework identifier (e.g. 'GDPR', 'SOC 2', 'ISO 27001')",
+    )
+    current_version: Optional[str] = Field(
+        default=None,
+        description="Baseline or current regulatory version (e.g. '2024', '2016', 'v1')",
+    )
+    draft_version: Optional[str] = Field(
+        default=None,
+        description="Target draft version identifier (e.g. '2026-draft', 'draft-v2')",
+    )
+    existing_version_id: Optional[UUID] = Field(
+        default=None,
+        description="Optional UUID of existing baseline regulatory version in DB/graph",
+    )
+    similarity_threshold: float = Field(
+        default=0.65,
+        ge=0.0,
+        le=1.0,
+        description="Semantic similarity threshold for matching obligations when clause IDs change",
+    )
+    max_depth: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description="Graph traversal depth limit for discovering indirect evidence (default 2)",
+    )
+    store_flags: bool = Field(
+        default=False,
+        description="Whether to persist evidence review flags in Neo4j graph (defaults to False to preserve read-only safety)",
+    )
+    provider: Optional[str] = Field(
+        default=None,
+        description="LLM provider override ('groq' or 'gemini')",
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="LLM model identifier override",
+    )
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_aliases(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Resolve draft_text from draft or text
+            if "draft_text" not in data:
+                for alias in ("draft", "text", "content", "draft_input"):
+                    if alias in data and data[alias]:
+                        data["draft_text"] = data[alias]
+                        break
+            # Resolve current_version from baseline_version or version
+            if "current_version" not in data:
+                for alias in ("baseline_version", "version", "currentVersion"):
+                    if alias in data and data[alias]:
+                        data["current_version"] = data[alias]
+                        break
+        return data
+
+
+
 

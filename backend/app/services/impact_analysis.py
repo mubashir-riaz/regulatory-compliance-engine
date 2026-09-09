@@ -104,10 +104,7 @@ from app.services.graph_service import (
 )
 from app.services.text_chunker import chunk_regulatory_text
 
-try:
-    from sqlalchemy.ext.asyncio import AsyncSession
-except ImportError:
-    AsyncSession = Any
+from sqlalchemy.ext.asyncio import AsyncSession
 
 try:
     from app.repositories.framework_repo import (

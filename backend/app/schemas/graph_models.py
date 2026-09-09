@@ -18,6 +18,7 @@ class GraphNodeLabel(str, Enum):
     OBLIGATION = "RegulatoryObligation"
     CONTROL_CATEGORY = "ControlCategory"
     EVIDENCE = "EvidenceArtifact"
+    IMPACT_FINDING = "DraftImpactFinding"
 
 
 class GraphRelationshipType(str, Enum):
@@ -27,6 +28,8 @@ class GraphRelationshipType(str, Enum):
     SATISFIES = "SATISFIES"
     DEPENDS_ON = "DEPENDS_ON"
     SUPERSEDES = "SUPERSEDES"
+    HAS_IMPACT_REVIEW = "HAS_IMPACT_REVIEW"
+    AFFECTS_OBLIGATION = "AFFECTS_OBLIGATION"
 
 
 # Convenience constants for direct imports
@@ -36,6 +39,8 @@ CATEGORIZED_AS = GraphRelationshipType.CATEGORIZED_AS.value
 SATISFIES = GraphRelationshipType.SATISFIES.value
 DEPENDS_ON = GraphRelationshipType.DEPENDS_ON.value
 SUPERSEDES = GraphRelationshipType.SUPERSEDES.value
+HAS_IMPACT_REVIEW = GraphRelationshipType.HAS_IMPACT_REVIEW.value
+AFFECTS_OBLIGATION = GraphRelationshipType.AFFECTS_OBLIGATION.value
 
 
 class BaseGraphNode(BaseModel):
@@ -167,3 +172,35 @@ class SupersedesRelationship(BaseGraphRelationship):
     """(RegulatoryVersion|RegulatoryObligation)-[:SUPERSEDES]->(RegulatoryVersion|RegulatoryObligation)"""
     rel_type: GraphRelationshipType = GraphRelationshipType.SUPERSEDES
     reason: Optional[str] = None
+
+
+class DraftImpactFinding(BaseGraphNode):
+    """
+    Represents a draft regulatory change impact finding on evidence (Phase 2, Step 7.4).
+    Kept separate from approved regulatory compliance state.
+    """
+    id: UUID = Field(default_factory=uuid4)
+    evidence_id: str
+    obligation_id: str
+    status: str = "NEEDS_REVIEW"
+    change_type: str = "MODIFIED"
+    reason: str
+    confidence: Optional[float] = None
+    clause: Optional[str] = None
+    framework: Optional[str] = None
+    draft_version: Optional[str] = None
+    previous_coverage: Optional[str] = None
+    flagged_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class HasImpactReviewRelationship(BaseGraphRelationship):
+    """(EvidenceArtifact)-[:HAS_IMPACT_REVIEW]->(DraftImpactFinding)"""
+    rel_type: GraphRelationshipType = GraphRelationshipType.HAS_IMPACT_REVIEW
+
+
+class AffectsObligationRelationship(BaseGraphRelationship):
+    """(DraftImpactFinding)-[:AFFECTS_OBLIGATION]->(RegulatoryObligation)"""
+    rel_type: GraphRelationshipType = GraphRelationshipType.AFFECTS_OBLIGATION
+

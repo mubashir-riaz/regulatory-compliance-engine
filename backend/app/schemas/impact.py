@@ -5,6 +5,7 @@ Defines data models for draft regulatory text input, extracted draft obligations
 and change impact analysis pipelines.
 """
 
+from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, Iterator, List, Optional, Union
 from uuid import UUID, uuid4
@@ -845,5 +846,313 @@ class TraverseImpactRequest(BaseModel):
     )
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# =============================================================================
+# Phase 2 Step 7.4: Flag Potentially Invalid Evidence Schemas
+# =============================================================================
+
+
+class EvidenceReviewStatus(str, Enum):
+    """
+    Non-destructive review status for evidence affected by regulatory changes (Step 7.4).
+    Prevents false conclusions by marking evidence as requiring review rather than
+    prematurely declaring it definitively invalid.
+    """
+    NEEDS_REVIEW = "NEEDS_REVIEW"
+    POTENTIALLY_INVALID = "POTENTIALLY_INVALID"
+    VALID = "VALID"
+    SUPERSEDED = "SUPERSEDED"
+
+
+# Convenience constants
+STATUS_NEEDS_REVIEW = EvidenceReviewStatus.NEEDS_REVIEW.value
+STATUS_POTENTIALLY_INVALID = EvidenceReviewStatus.POTENTIALLY_INVALID.value
+STATUS_VALID = EvidenceReviewStatus.VALID.value
+STATUS_SUPERSEDED = EvidenceReviewStatus.SUPERSEDED.value
+
+
+class FlaggedEvidenceRecord(BaseModel):
+    """
+    Structured impact review record for an evidence artifact connected to a
+    MODIFIED or REMOVED obligation (Phase 2, Step 7.4).
+
+    Flagged with a non-destructive status (NEEDS_REVIEW or POTENTIALLY_INVALID)
+    while strictly preserving existing coverage assessments and graph relationships.
+    """
+    evidence_id: str = Field(
+        ...,
+        description="Unique identifier of the EvidenceArtifact graph node",
+    )
+    status: Union[EvidenceReviewStatus, str] = Field(
+        default=EvidenceReviewStatus.NEEDS_REVIEW,
+        description="Non-destructive review status: 'NEEDS_REVIEW' or 'POTENTIALLY_INVALID'",
+    )
+    reason: str = Field(
+        ...,
+        description="Auditor explanation why compliance review is required",
+    )
+    obligation_id: str = Field(
+        ...,
+        description="Identifier of the directly or indirectly affected regulatory obligation",
+    )
+    clause: Optional[str] = Field(
+        default=None,
+        description="Clause or control code of the affected obligation (e.g. 'Article 5(1)(e)')",
+    )
+    obligation_title: Optional[str] = Field(
+        default=None,
+        description="Title of the affected obligation",
+    )
+    change_type: str = Field(
+        ...,
+        description="Classification of regulatory change triggering this review: 'MODIFIED' or 'REMOVED'",
+    )
+    impact_confidence: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score of the change impact classification where available",
+    )
+    evidence_name: Optional[str] = Field(
+        default=None,
+        description="File name or title of the evidence artifact",
+    )
+    file_path: Optional[str] = Field(
+        default=None,
+        description="Storage or repository path of the evidence artifact",
+    )
+    # Preservation of previous coverage information (must NOT overwrite or delete existing SATISFIES)
+    previous_coverage_status: Optional[str] = Field(
+        default=None,
+        description="Preserved existing coverage status from SATISFIES edge (e.g. 'FULL', 'PARTIAL', 'approved')",
+    )
+    previous_confidence: Optional[float] = Field(
+        default=None,
+        description="Preserved previous assessment confidence score from SATISFIES edge",
+    )
+    previous_reasoning: Optional[str] = Field(
+        default=None,
+        description="Preserved previous auditor reasoning from SATISFIES edge",
+    )
+    previous_evidence_text: Optional[str] = Field(
+        default=None,
+        description="Preserved evidence snippet from SATISFIES edge",
+    )
+    root_obligation_id: Optional[str] = Field(
+        default=None,
+        description="Root modified/removed obligation ID that initiated graph traversal",
+    )
+    root_clause: Optional[str] = Field(
+        default=None,
+        description="Root modified/removed obligation clause",
+    )
+    impact_type: str = Field(
+        default="DIRECT",
+        description="Impact category: 'DIRECT' (depth 1) or 'INDIRECT' (depth >= 2)",
+    )
+    traversal_depth: int = Field(
+        default=1,
+        description="Graph hop distance from changed obligation to evidence artifact",
+    )
+    framework: Optional[str] = Field(
+        default=None,
+        description="Regulatory framework identifier (e.g. 'GDPR', 'SOC 2')",
+    )
+    draft_version: Optional[str] = Field(
+        default=None,
+        description="Draft or target regulation version triggering the review",
+    )
+    flagged_at: Optional[datetime] = Field(
+        default_factory=datetime.utcnow,
+        description="Timestamp when the evidence review flag was generated",
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Supplementary audit and provenance metadata",
+    )
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def normalize_status(cls, v: Any) -> str:
+        if isinstance(v, EvidenceReviewStatus):
+            return v.value
+        if isinstance(v, str):
+            v_upper = v.strip().upper()
+            if v_upper in EvidenceReviewStatus.__members__:
+                return EvidenceReviewStatus(v_upper).value
+            return v_upper
+        return EvidenceReviewStatus.NEEDS_REVIEW.value
+
+    @field_validator("evidence_id", "obligation_id", mode="before")
+    @classmethod
+    def stringify_ids(cls, v: Any) -> str:
+        return str(v) if v is not None else ""
+
+    def to_canonical_dict(self) -> Dict[str, Any]:
+        """
+        Export compact dictionary conforming to the canonical Step 7.4 specification example:
+        {
+          "evidence_id": "retention_policy_2026",
+          "status": "NEEDS_REVIEW",
+          "reason": "The obligation satisfied by this policy was modified in the draft regulation."
+        }
+        """
+        status_val = self.status.value if isinstance(self.status, EvidenceReviewStatus) else str(self.status)
+        return {
+            "evidence_id": self.evidence_id,
+            "status": status_val,
+            "reason": self.reason,
+        }
+
+    def to_summary_dict(self) -> Dict[str, Any]:
+        """
+        Export detailed dictionary including canonical fields plus affected obligation & change metadata.
+        """
+        status_val = self.status.value if isinstance(self.status, EvidenceReviewStatus) else str(self.status)
+        return {
+            "evidence_id": self.evidence_id,
+            "status": status_val,
+            "reason": self.reason,
+            "obligation_id": self.obligation_id,
+            "clause": self.clause,
+            "change_type": self.change_type,
+            "impact_confidence": self.impact_confidence,
+            "previous_coverage_status": self.previous_coverage_status,
+            "impact_type": self.impact_type,
+            "draft_version": self.draft_version,
+        }
+
+
+class EvidenceImpactReviewResult(BaseModel):
+    """
+    Aggregated result of Phase 2 Step 7.4 affected evidence review flagging.
+    Contains deduplicated list of flagged evidence records, summary metrics,
+    and preserved coverage state.
+    """
+    framework: Optional[str] = Field(
+        default=None,
+        description="Regulatory framework identifier",
+    )
+    baseline_version: Optional[str] = Field(
+        default=None,
+        description="Baseline version identifier",
+    )
+    draft_version: Optional[str] = Field(
+        default=None,
+        description="Draft version identifier",
+    )
+    flagged_items: List[FlaggedEvidenceRecord] = Field(
+        default_factory=list,
+        description="List of all flagged evidence review records",
+    )
+    total_flagged: int = Field(
+        default=0,
+        description="Total number of evidence-obligation impact pairings flagged",
+    )
+    total_unique_evidence: int = Field(
+        default=0,
+        description="Total unique evidence artifacts requiring compliance review",
+    )
+    unique_evidence_ids: List[str] = Field(
+        default_factory=list,
+        description="Deduplicated list of affected evidence IDs",
+    )
+    status_counts: Dict[str, int] = Field(
+        default_factory=dict,
+        description="Count of records by status (e.g. {'NEEDS_REVIEW': 3})",
+    )
+    change_type_counts: Dict[str, int] = Field(
+        default_factory=dict,
+        description="Count of records by change type (e.g. {'MODIFIED': 2, 'REMOVED': 1})",
+    )
+    canonical_summary: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="List of compact evidence review summary dicts matching canonical Step 7.4 format",
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Execution metadata including graph update flags, timing, etc.",
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+    def __iter__(self) -> Iterator[FlaggedEvidenceRecord]:
+        return iter(self.flagged_items)
+
+    def __len__(self) -> int:
+        return len(self.flagged_items)
+
+    def __getitem__(self, index: int) -> FlaggedEvidenceRecord:
+        return self.flagged_items[index]
+
+    def get_for_evidence(self, evidence_id: str) -> List[FlaggedEvidenceRecord]:
+        """Retrieve all review records for a specific evidence ID."""
+        target = str(evidence_id).strip().lower()
+        return [item for item in self.flagged_items if item.evidence_id.lower() == target]
+
+    def get_for_obligation(self, obligation_id: str) -> List[FlaggedEvidenceRecord]:
+        """Retrieve all review records for a specific obligation ID."""
+        target = str(obligation_id).strip().lower()
+        return [
+            item for item in self.flagged_items
+            if item.obligation_id.lower() == target
+            or (item.root_obligation_id and item.root_obligation_id.lower() == target)
+        ]
+
+
+class FlagEvidenceRequest(BaseModel):
+    """
+    Input request schema for flagging affected evidence (Phase 2, Step 7.4).
+    """
+    traversal_result: Optional[GraphImpactTraversalResult] = Field(
+        default=None,
+        description="Traversal result from Step 7.3 containing impacted evidence",
+    )
+    comparison_result: Optional[ObligationComparisonResult] = Field(
+        default=None,
+        description="Comparison result from Step 7.2 containing classified obligation changes",
+    )
+    affected_evidence: Optional[List[Union[AffectedEvidenceItem, Dict[str, Any]]]] = Field(
+        default=None,
+        description="Explicit list of affected evidence items to flag",
+    )
+    default_status: Union[EvidenceReviewStatus, str] = Field(
+        default=EvidenceReviewStatus.NEEDS_REVIEW,
+        description="Non-destructive review status to assign ('NEEDS_REVIEW' or 'POTENTIALLY_INVALID')",
+    )
+    store_in_graph: bool = Field(
+        default=True,
+        description="Whether to record review flags and impact findings in the Neo4j graph",
+    )
+    update_relationship: bool = Field(
+        default=True,
+        description="Whether to attach non-destructive impact properties to existing SATISFIES edges",
+    )
+    create_impact_nodes: bool = Field(
+        default=True,
+        description="Whether to create separate DraftImpactFinding nodes to isolate draft findings from approved state",
+    )
+    custom_reason: Optional[str] = Field(
+        default=None,
+        description="Optional custom reason template (supports {clause}, {change_type}, {obligation_id})",
+    )
+    framework: Optional[str] = Field(
+        default=None,
+        description="Framework identifier override",
+    )
+    baseline_version: Optional[str] = Field(
+        default=None,
+        description="Baseline version identifier override",
+    )
+    draft_version: Optional[str] = Field(
+        default=None,
+        description="Draft version identifier override",
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
 
 

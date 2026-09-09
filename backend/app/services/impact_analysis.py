@@ -1,5 +1,5 @@
 """
-Change Impact Analysis Service (Phase 2, Step 7.1, 7.2 & 7.3).
+Change Impact Analysis Service (Phase 2, Step 7.1, 7.2, 7.3 & 7.4).
 
 Accepts new or draft regulatory text, extracts discrete structured obligations
 using the existing ExtractionService (Phase 2, Step 3), validates them, and preserves
@@ -25,7 +25,14 @@ Step 7.3 traverses the Neo4j regulatory graph for MODIFIED and REMOVED obligatio
 - Limits traversal depth to prevent runaway queries.
 - Preserves complete provenance linking every finding back to graph nodes.
 - Preserves relationship metadata (confidence, coverage_status, reasoning, similarity_score).
-- Read-only safety: does not yet permanently invalidate evidence.
+
+Step 7.4 flags impacted evidence artifacts for compliance review:
+- Marks evidence linked to MODIFIED or REMOVED obligations with a non-destructive status
+  (NEEDS_REVIEW or POTENTIALLY_INVALID) without prematurely declaring invalidity.
+- Avoids deleting existing SATISFIES relationships and strictly preserves previous coverage results.
+- Stores evidence ID, affected obligation ID, change type, reason, and impact confidence.
+- Guarantees idempotency (repeat executions update existing records without creating duplicates).
+- Keeps draft-impact findings separate from approved regulatory compliance state.
 """
 
 import difflib
@@ -57,12 +64,20 @@ from app.schemas.impact import (
     DraftExtractionResult,
     DraftObligation,
     DraftRegulationInput,
+    EvidenceImpactReviewResult,
+    EvidenceReviewStatus,
+    FlagEvidenceRequest,
+    FlaggedEvidenceRecord,
     GraphImpactTraversalResult,
     ImpactedObligationTraversal,
     ImpactProvenance,
     ObligationChangeType,
     ObligationComparisonItem,
     ObligationComparisonResult,
+    STATUS_NEEDS_REVIEW,
+    STATUS_POTENTIALLY_INVALID,
+    STATUS_SUPERSEDED,
+    STATUS_VALID,
     SupersededObligationItem,
     TraverseImpactRequest,
 )
@@ -2104,10 +2119,321 @@ Return valid JSON:
             logger.warning(f"Failed to query indirect evidence for '{obligation_id or clause}': {e}")
             return []
 
-    # Step 7.4 hook placeholder
-    # async def mark_evidence_potentially_invalid(...):
-    #     """Flag evidence artifacts needing re-certification (Step 7.4)."""
-    #     pass
+    # -------------------------------------------------------------------------
+    # Step 7.4: Flag Potentially Invalid Evidence
+    # -------------------------------------------------------------------------
+
+    async def flag_impacted_evidence(
+        self,
+        traversal_result: Optional[Union[GraphImpactTraversalResult, Sequence[AffectedEvidenceItem], Dict[str, Any]]] = None,
+        comparison_result: Optional[Union[ObligationComparisonResult, Sequence[ObligationComparisonItem], Dict[str, Any]]] = None,
+        affected_evidence: Optional[Sequence[Union[AffectedEvidenceItem, Dict[str, Any]]]] = None,
+        default_status: Union[str, EvidenceReviewStatus] = EvidenceReviewStatus.NEEDS_REVIEW,
+        store_in_graph: bool = True,
+        update_relationship: bool = True,
+        create_impact_nodes: bool = True,
+        framework: Optional[str] = None,
+        baseline_version: Optional[str] = None,
+        draft_version: Optional[str] = None,
+        custom_reason: Optional[str] = None,
+    ) -> EvidenceImpactReviewResult:
+        """
+        Mark evidence linked to MODIFIED or REMOVED obligations as requiring compliance review (Phase 2, Step 7.4).
+
+        Guarantees:
+        1. Non-destructive flagging: Uses status such as NEEDS_REVIEW or POTENTIALLY_INVALID.
+           Does not prematurely declare evidence definitely invalid.
+        2. Preserves existing coverage results: Existing SATISFIES edges, coverage_status (FULL/PARTIAL),
+           confidence, reasoning, and snippets are NOT deleted or overwritten.
+        3. Separates draft findings: Draft impact findings can be stored separately (DraftImpactFinding nodes)
+           to keep draft analysis segregated from approved regulatory state.
+        4. Idempotency: Running this analysis repeatedly does not create duplicate impact records.
+
+        :param traversal_result: GraphImpactTraversalResult from Step 7.3 or list of affected evidence items
+        :param comparison_result: ObligationComparisonResult from Step 7.2 (if traversal_result is omitted,
+                                  graph traversal is automatically performed)
+        :param affected_evidence: Explicit list of affected evidence items or dicts
+        :param default_status: Non-destructive review status ('NEEDS_REVIEW' or 'POTENTIALLY_INVALID')
+        :param store_in_graph: If True, persists flags in the Neo4j graph database
+        :param update_relationship: If True, writes review properties to existing SATISFIES relationship
+        :param create_impact_nodes: If True, creates separate DraftImpactFinding nodes
+        :param framework: Framework identifier override
+        :param baseline_version: Baseline version identifier override
+        :param draft_version: Draft version identifier override
+        :param custom_reason: Optional custom reason template override
+        :return: EvidenceImpactReviewResult containing flagged evidence records and canonical summaries
+        """
+        fw = framework
+        b_ver = baseline_version
+        d_ver = draft_version
+
+        raw_items: List[Any] = []
+
+        # 1. Resolve from traversal_result
+        if isinstance(traversal_result, GraphImpactTraversalResult):
+            fw = fw or traversal_result.framework
+            b_ver = b_ver or traversal_result.baseline_version
+            d_ver = d_ver or traversal_result.draft_version
+            raw_items.extend(traversal_result.affected_evidence_items)
+        elif isinstance(traversal_result, (list, tuple)):
+            raw_items.extend(traversal_result)
+        elif isinstance(traversal_result, dict):
+            fw = fw or traversal_result.get("framework")
+            b_ver = b_ver or traversal_result.get("baseline_version")
+            d_ver = d_ver or traversal_result.get("draft_version")
+            items_in_dict = (
+                traversal_result.get("affected_evidence_items")
+                or traversal_result.get("evidence_items")
+                or []
+            )
+            raw_items.extend(items_in_dict)
+
+        # 2. Resolve from explicit affected_evidence
+        if affected_evidence:
+            raw_items.extend(affected_evidence)
+
+        # 3. If no items yet, but comparison_result provided, auto-traverse Step 7.3
+        if not raw_items and comparison_result is not None:
+            logger.info("No affected evidence supplied directly; executing graph impact traversal from comparison result...")
+            traversal = await self.traverse_affected_evidence(
+                comparison_result=comparison_result,
+                framework=fw,
+                baseline_version=b_ver,
+                draft_version=d_ver,
+            )
+            fw = fw or traversal.framework
+            b_ver = b_ver or traversal.baseline_version
+            d_ver = d_ver or traversal.draft_version
+            raw_items.extend(traversal.affected_evidence_items)
+
+        # 4. Resolve status
+        norm_status = default_status.value if hasattr(default_status, "value") else str(default_status).strip().upper()
+        if norm_status not in ("NEEDS_REVIEW", "POTENTIALLY_INVALID", "VALID", "SUPERSEDED"):
+            norm_status = "NEEDS_REVIEW"
+
+        # 5. Deduplication & Flagging
+        flagged_items: List[FlaggedEvidenceRecord] = []
+        seen_keys: Set[Tuple[str, str, str]] = set()
+        seen_evidence_ids: List[str] = []
+        seen_evidence_id_set: Set[str] = set()
+
+        for item in raw_items:
+            # Unpack item
+            if isinstance(item, AffectedEvidenceItem):
+                ev_id = str(item.evidence_id)
+                ob_id = str(item.obligation_id)
+                clause = item.clause
+                ob_title = item.obligation_title
+                ev_name = item.evidence_name
+                file_path = item.file_path
+                change_type = (item.change_type or "MODIFIED").strip().upper()
+                impact_conf = item.confidence
+                prev_cov = item.coverage_status
+                prev_conf = item.confidence
+                prev_reas = item.reasoning
+                prev_text = item.evidence_text
+                root_ob_id = item.root_obligation_id or ob_id
+                root_clause = item.root_clause or clause
+                impact_type = item.impact_type or "DIRECT"
+                depth = item.depth
+                meta = dict(item.metadata or {})
+            elif isinstance(item, dict):
+                ev_id = str(item.get("evidence_id") or item.get("id") or "")
+                ob_id = str(item.get("obligation_id") or "")
+                clause = item.get("clause")
+                ob_title = item.get("obligation_title") or item.get("title")
+                ev_name = item.get("evidence_name") or item.get("name") or "Unnamed Evidence"
+                file_path = item.get("file_path")
+                change_type = str(item.get("change_type") or "MODIFIED").strip().upper()
+                impact_conf = float(item["confidence"]) if item.get("confidence") is not None else None
+                prev_cov = item.get("coverage_status") or item.get("coverage") or item.get("previous_coverage_status")
+                prev_conf = float(item["previous_confidence"]) if item.get("previous_confidence") is not None else impact_conf
+                prev_reas = item.get("reasoning") or item.get("previous_reasoning")
+                prev_text = item.get("evidence_text") or item.get("previous_evidence_text")
+                root_ob_id = str(item.get("root_obligation_id") or ob_id)
+                root_clause = item.get("root_clause") or clause
+                impact_type = str(item.get("impact_type") or "DIRECT")
+                depth = int(item.get("depth") or 1)
+                meta = dict(item.get("metadata") or {})
+            else:
+                continue
+
+            if not ev_id or not ob_id:
+                continue
+
+            # Only flag evidence linked to MODIFIED or REMOVED obligations
+            if change_type not in (CHANGE_MODIFIED, CHANGE_REMOVED, "MODIFIED", "REMOVED"):
+                logger.debug(f"Skipping evidence '{ev_id}' linked to non-impacted change_type='{change_type}'.")
+                continue
+
+            # Idempotency key: prevents duplicate impact records on repeat executions
+            dedup_key = (ev_id.lower(), ob_id.lower(), (d_ver or "").lower())
+            if dedup_key in seen_keys:
+                logger.debug(f"Skipping duplicate evidence impact record for ({ev_id}, {ob_id}).")
+                continue
+            seen_keys.add(dedup_key)
+
+            # Build auditor-grade, non-destructive reason
+            reason = self._build_review_reason(
+                change_type=change_type,
+                clause=clause,
+                obligation_id=ob_id,
+                custom_reason=custom_reason,
+                existing_reason=meta.get("change_reason") or prev_reas,
+            )
+
+            # Construct FlaggedEvidenceRecord
+            record = FlaggedEvidenceRecord(
+                evidence_id=ev_id,
+                status=norm_status,
+                reason=reason,
+                obligation_id=ob_id,
+                clause=clause,
+                obligation_title=ob_title,
+                change_type=change_type,
+                impact_confidence=impact_conf if impact_conf is not None else 0.95,
+                evidence_name=ev_name,
+                file_path=file_path,
+                previous_coverage_status=prev_cov,
+                previous_confidence=prev_conf,
+                previous_reasoning=prev_reas,
+                previous_evidence_text=prev_text,
+                root_obligation_id=root_ob_id,
+                root_clause=root_clause,
+                impact_type=impact_type,
+                traversal_depth=depth,
+                framework=fw,
+                draft_version=d_ver,
+                metadata={
+                    "source": "impact_analysis_service",
+                    **meta,
+                },
+            )
+
+            # Persist to Neo4j graph if requested and graph_service is active
+            if store_in_graph and self.graph_service:
+                try:
+                    await self.graph_service.flag_evidence_impact(
+                        evidence_id=ev_id,
+                        obligation_id=ob_id,
+                        status=norm_status,
+                        reason=reason,
+                        change_type=change_type,
+                        confidence=record.impact_confidence,
+                        clause=clause,
+                        framework=fw,
+                        draft_version=d_ver,
+                        previous_coverage=prev_cov,
+                        update_relationship=update_relationship,
+                        create_impact_node=create_impact_nodes,
+                    )
+                except Exception as graph_err:
+                    logger.warning(f"Failed to persist evidence impact flag in Neo4j for ({ev_id}, {ob_id}): {graph_err}")
+
+            flagged_items.append(record)
+
+            if ev_id not in seen_evidence_id_set:
+                seen_evidence_id_set.add(ev_id)
+                seen_evidence_ids.append(ev_id)
+
+        # 6. Build summary metrics
+        status_counts: Dict[str, int] = {}
+        for item in flagged_items:
+            st = item.status if isinstance(item.status, str) else item.status.value
+            status_counts[st] = status_counts.get(st, 0) + 1
+
+        change_type_counts: Dict[str, int] = {}
+        for item in flagged_items:
+            ct = item.change_type
+            change_type_counts[ct] = change_type_counts.get(ct, 0) + 1
+
+        canonical_summary = [item.to_canonical_dict() for item in flagged_items]
+
+        logger.info(
+            f"Evidence review flagging complete: {len(flagged_items)} items flagged "
+            f"across {len(seen_evidence_ids)} unique evidence artifacts "
+            f"(status_counts={status_counts}, change_counts={change_type_counts})."
+        )
+
+        return EvidenceImpactReviewResult(
+            framework=fw,
+            baseline_version=b_ver,
+            draft_version=d_ver,
+            flagged_items=flagged_items,
+            total_flagged=len(flagged_items),
+            total_unique_evidence=len(seen_evidence_ids),
+            unique_evidence_ids=seen_evidence_ids,
+            status_counts=status_counts,
+            change_type_counts=change_type_counts,
+            canonical_summary=canonical_summary,
+            metadata={
+                "store_in_graph": store_in_graph,
+                "update_relationship": update_relationship,
+                "create_impact_nodes": create_impact_nodes,
+                "default_status": norm_status,
+            },
+        )
+
+    def _build_review_reason(
+        self,
+        change_type: str,
+        clause: Optional[str] = None,
+        obligation_id: Optional[str] = None,
+        custom_reason: Optional[str] = None,
+        existing_reason: Optional[str] = None,
+    ) -> str:
+        """
+        Construct a precise, auditor-grade review reason adhering to Step 7.4 specifications:
+        "Important: don't immediately say the evidence is definitely invalid.
+        Instead mark it as something like NEEDS_REVIEW or POTENTIALLY_INVALID.
+        Example: The obligation satisfied by this policy was modified in the draft regulation."
+        """
+        if custom_reason:
+            clause_str = clause or obligation_id or "specified"
+            return custom_reason.format(
+                clause=clause_str,
+                obligation_id=obligation_id or "",
+                change_type=change_type,
+            )
+
+        c_upper = change_type.upper()
+        if c_upper == "REMOVED":
+            return "The obligation satisfied by this policy was removed in the draft regulation."
+        else:
+            # Default to canonical formulation for MODIFIED
+            return "The obligation satisfied by this policy was modified in the draft regulation."
+
+    async def mark_evidence_potentially_invalid(
+        self,
+        traversal_result: Optional[Union[GraphImpactTraversalResult, Sequence[AffectedEvidenceItem], Dict[str, Any]]] = None,
+        comparison_result: Optional[Union[ObligationComparisonResult, Sequence[ObligationComparisonItem], Dict[str, Any]]] = None,
+        affected_evidence: Optional[Sequence[Union[AffectedEvidenceItem, Dict[str, Any]]]] = None,
+        default_status: Union[str, EvidenceReviewStatus] = EvidenceReviewStatus.POTENTIALLY_INVALID,
+        store_in_graph: bool = True,
+        update_relationship: bool = True,
+        create_impact_nodes: bool = True,
+        framework: Optional[str] = None,
+        baseline_version: Optional[str] = None,
+        draft_version: Optional[str] = None,
+        custom_reason: Optional[str] = None,
+    ) -> EvidenceImpactReviewResult:
+        """
+        Flag evidence artifacts as POTENTIALLY_INVALID needing re-certification (Phase 2, Step 7.4).
+        """
+        return await self.flag_impacted_evidence(
+            traversal_result=traversal_result,
+            comparison_result=comparison_result,
+            affected_evidence=affected_evidence,
+            default_status=default_status,
+            store_in_graph=store_in_graph,
+            update_relationship=update_relationship,
+            create_impact_nodes=create_impact_nodes,
+            framework=framework,
+            baseline_version=baseline_version,
+            draft_version=draft_version,
+            custom_reason=custom_reason,
+        )
+
 
     # Step 7.5 hook placeholder
     # async def generate_impact_report(...):
@@ -2282,4 +2608,69 @@ async def find_connected_evidence(
         include_supersedes=include_supersedes,
         include_controls=include_controls,
     )
+
+
+async def flag_impacted_evidence(
+    traversal_result: Optional[Union[GraphImpactTraversalResult, Sequence[AffectedEvidenceItem], Dict[str, Any]]] = None,
+    comparison_result: Optional[Union[ObligationComparisonResult, Sequence[ObligationComparisonItem], Dict[str, Any]]] = None,
+    affected_evidence: Optional[Sequence[Union[AffectedEvidenceItem, Dict[str, Any]]]] = None,
+    default_status: Union[str, EvidenceReviewStatus] = EvidenceReviewStatus.NEEDS_REVIEW,
+    store_in_graph: bool = True,
+    update_relationship: bool = True,
+    create_impact_nodes: bool = True,
+    framework: Optional[str] = None,
+    baseline_version: Optional[str] = None,
+    draft_version: Optional[str] = None,
+    custom_reason: Optional[str] = None,
+) -> EvidenceImpactReviewResult:
+    """
+    Top-level convenience function for Phase 2 Step 7.4: Flag Potentially Invalid Evidence.
+    Marks evidence artifacts connected to MODIFIED or REMOVED obligations with a non-destructive
+    status (NEEDS_REVIEW or POTENTIALLY_INVALID) while preserving existing coverage results.
+    """
+    return await impact_analysis_service.flag_impacted_evidence(
+        traversal_result=traversal_result,
+        comparison_result=comparison_result,
+        affected_evidence=affected_evidence,
+        default_status=default_status,
+        store_in_graph=store_in_graph,
+        update_relationship=update_relationship,
+        create_impact_nodes=create_impact_nodes,
+        framework=framework,
+        baseline_version=baseline_version,
+        draft_version=draft_version,
+        custom_reason=custom_reason,
+    )
+
+
+async def mark_evidence_potentially_invalid(
+    traversal_result: Optional[Union[GraphImpactTraversalResult, Sequence[AffectedEvidenceItem], Dict[str, Any]]] = None,
+    comparison_result: Optional[Union[ObligationComparisonResult, Sequence[ObligationComparisonItem], Dict[str, Any]]] = None,
+    affected_evidence: Optional[Sequence[Union[AffectedEvidenceItem, Dict[str, Any]]]] = None,
+    default_status: Union[str, EvidenceReviewStatus] = EvidenceReviewStatus.POTENTIALLY_INVALID,
+    store_in_graph: bool = True,
+    update_relationship: bool = True,
+    create_impact_nodes: bool = True,
+    framework: Optional[str] = None,
+    baseline_version: Optional[str] = None,
+    draft_version: Optional[str] = None,
+    custom_reason: Optional[str] = None,
+) -> EvidenceImpactReviewResult:
+    """
+    Top-level convenience function for Phase 2 Step 7.4: Mark evidence as POTENTIALLY_INVALID.
+    """
+    return await impact_analysis_service.mark_evidence_potentially_invalid(
+        traversal_result=traversal_result,
+        comparison_result=comparison_result,
+        affected_evidence=affected_evidence,
+        default_status=default_status,
+        store_in_graph=store_in_graph,
+        update_relationship=update_relationship,
+        create_impact_nodes=create_impact_nodes,
+        framework=framework,
+        baseline_version=baseline_version,
+        draft_version=draft_version,
+        custom_reason=custom_reason,
+    )
+
 

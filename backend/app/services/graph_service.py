@@ -580,7 +580,193 @@ class GraphService:
             query,
             parameters={"source_id": str(source_id), "target_id": str(target_id)},
         )
-        return results[0] if results else None
+    # -------------------------------------------------------------------------
+    # Phase 2 Step 7.4: Evidence Impact Review Flagging
+    # -------------------------------------------------------------------------
+
+    async def flag_evidence_impact(
+        self,
+        evidence_id: Union[str, UUID],
+        obligation_id: Union[str, UUID],
+        status: str = "NEEDS_REVIEW",
+        reason: str = "",
+        change_type: str = "MODIFIED",
+        confidence: Optional[float] = None,
+        clause: Optional[str] = None,
+        framework: Optional[str] = None,
+        draft_version: Optional[str] = None,
+        previous_coverage: Optional[str] = None,
+        update_relationship: bool = True,
+        create_impact_node: bool = True,
+        properties: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Flag an evidence artifact impacted by a changed obligation (Phase 2, Step 7.4).
+
+        Guarantees:
+        1. Non-destructive: Existing SATISFIES relationships are NEVER deleted.
+        2. Preserves existing coverage results (coverage, coverage_status, reasoning, confidence).
+        3. Idempotent: Multiple runs update properties via Cypher MERGE without creating duplicates.
+        4. State isolation: Can persist separate DraftImpactFinding nodes to keep draft-impact
+           findings separate from approved regulatory compliance state.
+
+        :param evidence_id: UUID or string ID of the EvidenceArtifact node
+        :param obligation_id: UUID or string ID of the RegulatoryObligation node
+        :param status: Non-destructive review status ('NEEDS_REVIEW' or 'POTENTIALLY_INVALID')
+        :param reason: Auditor justification for review
+        :param change_type: 'MODIFIED' or 'REMOVED'
+        :param confidence: Change impact confidence score (0.0 to 1.0)
+        :param clause: Obligation clause or code
+        :param framework: Framework name (e.g. 'GDPR', 'SOC 2')
+        :param draft_version: Draft version identifier (e.g. '2024-draft')
+        :param previous_coverage: Preserved previous coverage status (e.g. 'FULL', 'PARTIAL')
+        :param update_relationship: If True, attaches review properties to existing SATISFIES edge
+        :param create_impact_node: If True, creates/merges separate DraftImpactFinding node
+        :param properties: Optional extra properties dictionary
+        :return: Dict containing execution status, relationship properties, and impact finding properties
+        """
+        ev_id_str = str(evidence_id)
+        ob_id_str = str(obligation_id)
+        now_iso = datetime.utcnow().isoformat()
+
+        result_data: Dict[str, Any] = {
+            "evidence_id": ev_id_str,
+            "obligation_id": ob_id_str,
+            "status": status,
+            "change_type": change_type,
+            "reason": reason,
+            "confidence": confidence,
+            "draft_version": draft_version,
+            "flagged_at": now_iso,
+        }
+
+        # 1. Update existing SATISFIES relationship non-destructively
+        if update_relationship:
+            query_rel = """
+            MATCH (e:EvidenceArtifact)-[r:SATISFIES]-(o:RegulatoryObligation)
+            WHERE (e.id = $evidence_id OR toString(e.id) = toString($evidence_id))
+              AND (o.id = $obligation_id OR toString(o.id) = toString($obligation_id))
+            SET r.review_status = $status,
+                r.impact_status = $status,
+                r.impact_reason = $reason,
+                r.impact_change_type = $change_type,
+                r.impact_confidence = $confidence,
+                r.impact_draft_version = $draft_version,
+                r.impact_flagged_at = $flagged_at
+            RETURN properties(r) AS relationship_properties
+            """
+            params_rel = {
+                "evidence_id": ev_id_str,
+                "obligation_id": ob_id_str,
+                "status": status,
+                "reason": reason,
+                "change_type": change_type,
+                "confidence": round(float(confidence), 4) if confidence is not None else None,
+                "draft_version": draft_version,
+                "flagged_at": now_iso,
+            }
+            try:
+                rel_res = await self.execute_query(query_rel, parameters=params_rel)
+                if rel_res and "relationship_properties" in rel_res[0]:
+                    result_data["relationship_properties"] = rel_res[0]["relationship_properties"]
+            except Exception as e:
+                logger.warning(f"Failed to update SATISFIES relationship impact properties: {e}")
+
+        # 2. Store separate DraftImpactFinding node to isolate draft findings from approved state
+        if create_impact_node:
+            query_node = """
+            MERGE (f:DraftImpactFinding {
+                evidence_id: $evidence_id,
+                obligation_id: $obligation_id,
+                draft_version: $draft_version_key
+            })
+            SET f.status = $status,
+                f.change_type = $change_type,
+                f.reason = $reason,
+                f.confidence = $confidence,
+                f.clause = $clause,
+                f.framework = $framework,
+                f.draft_version = $draft_version,
+                f.previous_coverage = $previous_coverage,
+                f.flagged_at = $flagged_at,
+                f.updated_at = $flagged_at
+
+            WITH f
+            OPTIONAL MATCH (e:EvidenceArtifact)
+            WHERE e.id = $evidence_id OR toString(e.id) = toString($evidence_id)
+            FOREACH (_ IN CASE WHEN e IS NOT NULL THEN [1] ELSE [] END |
+                MERGE (e)-[:HAS_IMPACT_REVIEW]->(f)
+            )
+
+            WITH f
+            OPTIONAL MATCH (o:RegulatoryObligation)
+            WHERE o.id = $obligation_id OR toString(o.id) = toString($obligation_id)
+            FOREACH (_ IN CASE WHEN o IS NOT NULL THEN [1] ELSE [] END |
+                MERGE (f)-[:AFFECTS_OBLIGATION]->(o)
+            )
+
+            RETURN properties(f) AS finding_properties
+            """
+            params_node = {
+                "evidence_id": ev_id_str,
+                "obligation_id": ob_id_str,
+                "draft_version_key": draft_version or "default-draft",
+                "draft_version": draft_version,
+                "status": status,
+                "change_type": change_type,
+                "reason": reason,
+                "confidence": round(float(confidence), 4) if confidence is not None else None,
+                "clause": clause,
+                "framework": framework,
+                "previous_coverage": previous_coverage,
+                "flagged_at": now_iso,
+            }
+            try:
+                node_res = await self.execute_query(query_node, parameters=params_node)
+                if node_res and "finding_properties" in node_res[0]:
+                    result_data["finding_properties"] = node_res[0]["finding_properties"]
+            except Exception as e:
+                logger.warning(f"Failed to create DraftImpactFinding node: {e}")
+
+        return result_data
+
+    async def get_flagged_evidence(
+        self,
+        framework: Optional[str] = None,
+        draft_version: Optional[str] = None,
+        status: Optional[str] = None,
+        evidence_id: Optional[Union[str, UUID]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Query flagged evidence impact findings from Neo4j graph (Phase 2, Step 7.4).
+
+        :param framework: Optional framework filter
+        :param draft_version: Optional draft version filter
+        :param status: Optional review status filter ('NEEDS_REVIEW', 'POTENTIALLY_INVALID')
+        :param evidence_id: Optional evidence artifact ID filter
+        :return: List of record property dictionaries
+        """
+        query = """
+        MATCH (f:DraftImpactFinding)
+        WHERE ($framework IS NULL OR toLower(coalesce(f.framework, '')) = toLower($framework))
+          AND ($draft_version IS NULL OR toLower(coalesce(f.draft_version, '')) = toLower($draft_version))
+          AND ($status IS NULL OR toLower(coalesce(f.status, '')) = toLower($status))
+          AND ($evidence_id IS NULL OR f.evidence_id = $evidence_id OR toString(f.evidence_id) = toString($evidence_id))
+        RETURN properties(f) AS finding
+        ORDER BY f.flagged_at DESC
+        """
+        params = {
+            "framework": framework,
+            "draft_version": draft_version,
+            "status": status,
+            "evidence_id": str(evidence_id) if evidence_id else None,
+        }
+        try:
+            records = await self.execute_query(query, parameters=params)
+            return [r["finding"] for r in records if "finding" in r]
+        except Exception as e:
+            logger.warning(f"Failed to query flagged evidence: {e}")
+            return []
 
     # -------------------------------------------------------------------------
     # Sample Graph Creation & Verification (Phase 2, Step 2.3)
